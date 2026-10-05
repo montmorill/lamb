@@ -8,7 +8,7 @@ Tiny Pure Functional Programming Language in C. Based on [Untype Lambda Calculus
 ## Quick Start
 
 ```console
-$ cc -o lamb lamb.c
+$ cc -o lamb sources/*.c
 $ ./lamb ./std.lamb
 ...
 ,---@>
