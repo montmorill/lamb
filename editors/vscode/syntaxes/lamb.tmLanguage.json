@@ -1,0 +1,81 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lamb",
+  "scopeName": "source.lamb",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#colon-command" },
+    { "include": "#lambda" },
+    { "include": "#backslash" },
+    { "include": "#definition" },
+    { "include": "#magic" },
+    { "include": "#punctuation" },
+    { "include": "#variable" }
+  ],
+  "repository": {
+    "comments": {
+      "match": "(//)(.*)$",
+      "captures": {
+        "1": { "name": "punctuation.definition.comment.lamb" },
+        "2": { "name": "comment.line.double-slash.lamb" }
+      }
+    },
+
+    "colon-command": {
+      "match": "(:)([A-Za-z]+)",
+      "captures": {
+        "1": { "name": "punctuation.definition.command.lamb" },
+        "2": { "name": "keyword.other.command.lamb" }
+      }
+    },
+
+    "lambda": {
+      "name": "meta.function.lambda.lamb",
+      "begin": "(\\\\)(?=\\s*[A-Za-z0-9_]+\\s*\\.)",
+      "beginCaptures": {
+        "1": { "name": "keyword.operator.lambda.lamb" }
+      },
+      "end": "(?!\\s*\\.)(?!\\s*[A-Za-z0-9_]+\\s*\\.)",
+      "patterns": [
+        {
+          "match": "[A-Za-z0-9_]+(?=\\s*\\.)",
+          "name": "variable.parameter.lamb"
+        },
+        {
+          "match": "\\.",
+          "name": "punctuation.separator.lambda.lamb"
+        }
+      ]
+    },
+
+    "backslash": {
+      "match": "\\\\",
+      "name": "keyword.operator.lambda.lamb"
+    },
+
+    "definition": {
+      "match": "[A-Za-z0-9_]+(?=\\s*=)",
+      "name": "entity.name.function.definition.lamb"
+    },
+
+    "magic": {
+      "match": "#[A-Za-z0-9_]*",
+      "name": "support.function.magic.lamb"
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "match": "\\(", "name": "punctuation.section.group.begin.lamb" },
+        { "match": "\\)", "name": "punctuation.section.group.end.lamb" },
+        { "match": "=", "name": "keyword.operator.assignment.lamb" },
+        { "match": ";", "name": "punctuation.terminator.statement.lamb" },
+        { "match": "\\.", "name": "punctuation.separator.lambda.lamb" }
+      ]
+    },
+
+    "variable": {
+      "match": "[A-Za-z0-9_]+",
+      "name": "variable.other.lamb"
+    }
+  }
+}

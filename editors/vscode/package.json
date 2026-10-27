@@ -1,0 +1,44 @@
+{
+  "name": "lamb-language",
+  "displayName": "Lamb",
+  "description": "Syntax highlighting and language configuration for the Lamb language.",
+  "version": "0.1.0",
+  "publisher": "montmorill",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tsoding/lamb.git"
+  },
+  "engines": {
+    "vscode": "^1.64.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lamb",
+        "aliases": [
+          "Lamb",
+          "lamb"
+        ],
+        "extensions": [
+          ".lamb"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./lamb.png",
+          "dark": "./lamb.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lamb",
+        "scopeName": "source.lamb",
+        "path": "./syntaxes/lamb.tmLanguage.json"
+      }
+    ]
+  }
+}
