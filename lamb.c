@@ -917,6 +917,36 @@ bool parse_expr(Lexer *l, Expr_Index *expr)
     return true;
 }
 
+bool parse_binding_body(Lexer *l, Expr_Index *body)
+{
+    // NOTE: the parameters of a binding are just syntactic sugar for nested lambdas.
+    // `f x y = body;` is equivalent to `f = \x.y.body;`
+    struct { Symbol *items; size_t count; size_t capacity; } params = {0};
+
+    for (;;) {
+        if (!lexer_next(l)) goto fail;
+        if (l->token != TOKEN_NAME) break;
+        da_append(&params, symbol(l->string.items));
+    }
+
+    if (l->token != TOKEN_EQUALS) {
+        report_unexpected(l, TOKEN_EQUALS);
+        goto fail;
+    }
+
+    if (!parse_expr(l, body)) goto fail;
+
+    for (size_t i = params.count; i > 0; --i) {
+        *body = fun(params.items[i - 1], *body);
+    }
+
+    free(params.items);
+    return true;
+fail:
+    free(params.items);
+    return false;
+}
+
 typedef struct {
     const char *name;
     const char *signature;
@@ -1034,9 +1064,8 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
     while (l.token != TOKEN_END) {
         if (!lexer_expect(&l, TOKEN_NAME)) return false;
         Symbol name = symbol(l.string.items);
-        if (!lexer_expect(&l, TOKEN_EQUALS)) return false;
         Expr_Index body;
-        if (!parse_expr(&l, &body)) return false;
+        if (!parse_binding_body(&l, &body)) return false;
         if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
         create_binding(bindings, name, body);
         if (!lexer_peek(&l)) return false;
@@ -1345,20 +1374,23 @@ again:
             goto again;
         }
 
-        Token_Kind a, b;
+        // NOTE: `name arg1 arg2 = body` is a binding definition.
+        bool is_binding = false;
         Cur cur = l.cur; {
             if (!lexer_next(&l)) goto again;
-            a = l.token;
-            if (!lexer_next(&l)) goto again;
-            b = l.token;
+            if (l.token == TOKEN_NAME) {
+                do {
+                    if (!lexer_next(&l)) goto again;
+                } while (l.token == TOKEN_NAME);
+                is_binding = l.token == TOKEN_EQUALS;
+            }
         } l.cur = cur;
 
-        if (a == TOKEN_NAME && b == TOKEN_EQUALS) {
+        if (is_binding) {
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
             Symbol name = symbol(l.string.items);
-            if (!lexer_expect(&l, TOKEN_EQUALS)) goto again;
             Expr_Index body;
-            if (!parse_expr(&l, &body)) goto again;
+            if (!parse_binding_body(&l, &body)) goto again;
             if (!lexer_expect(&l, TOKEN_END)) goto again;
             create_binding(&bindings, name, body);
             goto again;
