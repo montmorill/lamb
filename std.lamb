@@ -1,35 +1,53 @@
-id     = \x.x;
-Y      = \f.(\x.f (x x)) (\x.f (x x));
+id    x   = x;
+const x _ = x;
 
-// Booleans
-true   = \x.y.x;
-false  = \x.y.y;
-and    = \x.y.x y false;
-or     = \x.y.x true y;
-not    = \x.x false true;
-xor    = \x.y.x (not y) y;
-if     = id;
+omega x = x x;
+Omega = omega omega;
 
-// Numerals
-zero     = \f.x.x;
-inc      = \n.f.x.f (n f x);
-one      = inc zero;
-two      = inc one;
-three    = inc two;
-four     = inc three;
-plus n m = \f.x.m f (n f x);
-mult n m = \f.x.m (n f) x;
+Y f = omega (\x. f (x x));
+Z f = omega (\x. f(\v. x x v));
 
-// Pairs
-pair x y = \f.f x y;
-first  p = p true;
-second p = p false;
+// CBool : a -> a -> a
+tru t f = t;
+fls t f = f;
+and p q = p q fls;
+or  p q = p tru q;
+not p   = p fls tru;
+xor p q = p (not q) q;
 
-// Lists
-nil      = pair true true;
-isnil    = first;
-cons h t = pair false (pair h t);
-head l   = first (second l);
-tail l   = second (second l);
+// Pair : a -> a -> CBool -> a
+pair x y b = b x y;
+fst p = p tru;
+snd p = p fls;
+step f p = pair (f (fst p)) (fst p);
 
-trace_list = Y \rec.\xs.isnil xs nil (cons (#trace (head xs))) (rec (tail xs));
+// CNat : (a -> a) -> a -> a
+zero f x = x;
+succ n f x = f (n f x);
+one   = succ zero;
+two   = succ one;
+three = succ two;
+four  = succ three;
+five  = succ four;
+six   = succ five;
+seven = succ six;
+eight = succ seven;
+nine  = succ eight;
+ten   = succ nine;
+is-zero n = n (const fls) tru;
+is-even n = n not tru;
+add m n = n succ m;
+mul m n = n (add m) zero;
+pow m n = n (mul m) one;
+sub m n = n pred m;
+pred n = snd (n (step succ) (pair zero zero));
+
+// CList a : (a → r → r) → r → r
+nil c n = n;
+is-nil xs = xs (\_. _. fls) tru;
+cons x xs c n = c x (xs c n);
+length xs = xs (const succ) zero;
+head xs = xs const nil;
+tail xs = snd (l (\h. step (cons h)) (pair nil nil));
+
+trace_list = Y \rec. \xs. isnil xs nil (cons (#trace (head xs))) (rec (tail xs));

@@ -14,16 +14,16 @@ $ ./lamb ./std.lamb
 ,---@>
  W-W'
 Enter :help for more info
-@> pair 69 (pair 420 1337)
-RESULT: \f.f 69 (\f.f 420 1337)
-@> xs = pair 69 (pair 420 1337)
+@> pair foo (pair bar baz)
+RESULT: \b.b foo (\b.b bar baz)
+@> xs = pair foo (pair bar baz)
 Created binding xs
-@> first xs
-RESULT: 69
-@> second xs
-RESULT: \f.f 420 1337
-@> first (second xs)
-RESULT: 420
+@> fst xs
+RESULT: foo
+@> snd xs
+RESULT: \b.b bar baz
+@> fst (snd xs)
+RESULT: bar
 @>
 ```
 
