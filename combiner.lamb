@@ -1,0 +1,6 @@
+I x = x;
+K x y = x;
+S x y z = x z (y z);
+X x = x S K;
+// C a b c = a c b;
+// B a b c = a (b c);
