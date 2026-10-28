@@ -23,15 +23,15 @@ server, no build step.
 
 Type a backslash followed by an abbreviation and press **Tab**:
 
-| Typed | Result |
-| --- | --- |
+| Typed       | Result |
+| ----------- | ------ |
 | `\forall` | `∀` |
 | `\exists` | `∃` |
-| `\to` | `→` |
-| `\lam` | `λ` |
-| `\and` | `∧` |
-| `\le` | `≤` |
-| `\alpha` | `α` |
+| `\to`     | `→` |
+| `\lam`    | `λ` |
+| `\and`    | `∧` |
+| `\le`     | `≤` |
+| `\alpha`  | `α` |
 
 An underline appears under an abbreviation while **Tab** would convert it.
 Typing `\fo` and pressing Tab also works: the shortest abbreviation starting
@@ -67,13 +67,21 @@ Completion suggests:
 - binding names defined in the current file and in the nearest `std.lamb`
   (next to the file, or in a workspace folder);
 - REPL commands after `:`;
-- magics after `#` (`#trace`, `#void`).
+- magics after `#` (`#trace`, `#void`);
+- command arguments according to the interpreter's signatures: `:set `
+  suggests `debruijn`, `unicode`, and `shorthand`, `:set debruijn ` suggests
+  `on`, `off`, and `full`, `:set unicode ` and `:set shorthand ` suggest `on`
+  and `off`, `:delete ` and `:list ` suggest binding names, and `:ast ` /
+  `:debug ` suggest expression atoms. Path arguments (`:load`, `:save`,
+  `:edit`) and commands without arguments suggest nothing.
 
 Type at least one character, then press **Tab** to accept the best match, or
-**Ctrl+Space** to pick from the list. The extension enables
-`editor.tabCompletion` for Lamb files by default, which you can override in your
-settings. An empty prefix returns no items, so Tab still indents normally. When
-a Unicode abbreviation is underlined, Tab converts the abbreviation instead.
+**Ctrl+Space** to pick from the list. Command arguments are the exception: an
+empty argument prefix after `:set ` or `:delete ` already suggests values. The
+extension enables `editor.tabCompletion` for Lamb files by default, which you
+can override in your settings. An empty prefix elsewhere returns no items, so
+Tab still indents normally. When a Unicode abbreviation is underlined, Tab
+converts the abbreviation instead.
 
 Completion is disabled inside `//` comments. Binding names are read from the
 current document and from `std.lamb`; other files in the workspace are not
@@ -92,8 +100,8 @@ from the command palette and click the token.
 ### Installing without the dev host
 
 ```console
-$ npx @vscode/vsce package
-$ code --install-extension lamb-language-0.4.0.vsix
+npx @vscode/vsce package
+code --install-extension lamb-language-0.4.0.vsix
 ```
 
 ## Notes on the grammar
@@ -101,9 +109,10 @@ $ code --install-extension lamb-language-0.4.0.vsix
 The one non-obvious rule is parameter detection. In `\x.y.x` **both** `x` and `y`
 are parameters (the dropped-backslash shorthand), and the interpreter decides this
 in `parse_fun_scope()` (`lamb.c`): after reading a name followed by `.` it peeks
-two tokens and recurses if they are another name followed by `.`. The grammar
-mirrors that same predicate, so "a name immediately followed by `.` is a
-parameter" holds for valid code.
+a token and recurses if it is another name followed by `.`, or a lone `.` that
+starts another anonymous binder (`\..1` is `\.\.1`). The grammar mirrors that
+same predicate, so "a name immediately followed by `.` is a parameter" holds
+for valid code.
 
 A binder may also be anonymous: `\.body`. The grammar starts a lambda region for
 `\.` as well, so the dot is highlighted as a lambda separator even though there

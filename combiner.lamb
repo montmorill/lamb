@@ -4,3 +4,9 @@ S x y z = x z (y z);
 X x = x S K;
 // C a b c = a c b;
 // B a b c = a (b c);
+
+omega x = x x;
+Omega = omega omega;
+
+Y f = omega (\x. f (x x));
+Z f = omega (\x. f (\v. x x v));

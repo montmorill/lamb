@@ -27,13 +27,15 @@ RESULT: bar
 @>
 ```
 
-It's recommended to use Lamb with [rlwrap](https://github.com/hanslub42/rlwrap). Just do
+The REPL has built-in line editing, history, and Tab completion. Tab completes
+binding names, `:` commands, `#` magics, and command arguments according to
+their signatures, for example `:set debruijn ` suggests `on`, `off`, and
+`full`. Input that is not a terminal (a pipe or a file) is read without editing
+or completion.
 
-```console
-$ rlwrap ./lamb
-```
-
-and you get Bash-style history and command line navigation.
+On systems where the built-in editor is unavailable (for example a Windows
+console emulator that does not expose a console handle), [rlwrap](https://github.com/hanslub42/rlwrap)
+still provides Bash-style history and line navigation.
 
 ## Syntax
 
@@ -133,6 +135,18 @@ RESULT: \x.\.x
 @>
 ```
 
+Anonymous binders chain the same way: the rest of the backslashes can be dropped, so `\..1` means `\.\.1` and `\x..1` means `\x.\.1`. Since `.` cannot begin an expression, this is unambiguous:
+
+```
+@> :ast \..1
+[FUN] \.
++--[FUN] \.
+   +--[VAR] 1
+@>
+```
+
+More generally, after the dot that ends a binder declaration, another `.` starts an anonymous binder and `name.` starts a named one.
+
 ### De Bruijn Indices
 
 Internally, bound variables are De Bruijn indices; names only exist for our convenience. A numeric token is an index: number the surrounding binders from the inside out starting at `0`, and every index smaller than the number of binders refers to the corresponding binder:
@@ -194,14 +208,14 @@ RESULT: \x.43
 
 Use names rather than numbers for constants and free values to avoid this shift.
 
-To control how variables are printed, use the `:debruijn` command. With no argument it toggles between `off` and `on`; `:debruijn on`, `:debruijn off`, and `:debruijn full` set a mode explicitly:
+To control how variables are printed, use the `:set debruijn` command. Without a mode it toggles between `off` and `on`; `:set debruijn on`, `:set debruijn off`, and `:set debruijn full` set a mode explicitly:
 
 ```
-@> :debruijn
+@> :set debruijn
 De Bruijn indices output: ON
 @> \x.\y.x
 RESULT: \x.\y.1
-@> :debruijn off
+@> :set debruijn off
 De Bruijn indices output: OFF
 @> \x.\y.x
 RESULT: \x.\y.x
@@ -211,7 +225,7 @@ RESULT: \x.\y.x
 In `full` mode every binder is printed as `\.` and every variable occurrence as an index, so a closed term contains no names at all:
 
 ```
-@> :debruijn full
+@> :set debruijn full
 De Bruijn indices output: FULL
 @> \x.\y.x
 RESULT: \.\.1
@@ -225,6 +239,45 @@ RESULT: \.\.1
 Free variables have no binder that could give them an index. They are numbered by their first appearance and printed like free indices (with the current binder depth added), so the output stays nameless even for open terms. For example, `foo bar` prints as `0 1`.
 
 All three modes affect `:ast`, `:save`, and `:list` output.
+
+To print binders with the Unicode lambda `λ` instead of `\`, use `:set unicode on`. Without an argument the command toggles the setting; `:set unicode off` restores `\`:
+
+```
+@> :set unicode on
+Unicode lambda output: ON
+@> \x.\y.x
+RESULT: λx.λy.x
+@> :ast \x.x
+[FUN] λx
++--[VAR] x
+@> :set unicode off
+Unicode lambda output: OFF
+@>
+```
+
+The setting affects every place a term is printed (`RESULT`, `:ast`, `:save`, and `:list`). Since `λ` is valid input, a file saved in Unicode mode loads back unchanged. The default is `off`.
+
+To elide the symbol of chained binders, use `:set shorthand on`. The output uses the same dropped-backslash shorthand the parser accepts, for named and anonymous binders alike, so it round-trips:
+
+```
+@> :set shorthand on
+Lambda shorthand output: ON
+@> \x.\y.x
+RESULT: \x.y.x
+@> \.\.1
+RESULT: \..1
+@> :set unicode on
+Unicode lambda output: ON
+@> \x.\y.x
+RESULT: λx.y.x
+@> :set debruijn full
+De Bruijn indices output: FULL
+@> \x.\y.x
+RESULT: λ..1
+@>
+```
+
+`:debug`, `:save`, and `:list` use the same term printer and are affected as well; `:ast` is a tree dump with one binder per line, so it is not. The default is `off`.
 
 ## Applications
 

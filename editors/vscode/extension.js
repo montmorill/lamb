@@ -17,18 +17,52 @@ const ABBREVIATION_CHAR = /[A-Za-z0-9_=<>!+\-*/^|]/;
 const NAME_CHAR = /[\p{L}\p{N}_?'-]/u;
 const DEFINITION_NAME = /^(?![\p{Nd}])[\p{L}\p{N}_?'-]+/u;
 
+// [name, signature, description]. The signatures must match the ones the
+// interpreter prints in `:help`; argument completion is derived from them.
+// Keep this list in sync with COMMANDS in lamb.c.
 const COMMAND_COMPLETIONS = [
-    ['ast', 'Print the AST of an expression'],
-    ['debruijn', 'Set variable output: names, indices, or fully nameless'],
-    ['debug', 'Step through the evaluation of an expression'],
-    ['delete', 'Delete a binding by name'],
-    ['edit', 'Edit the active bindings file'],
-    ['help', 'Print the help message'],
-    ['list', 'List the bindings'],
-    ['load', 'Load or reload bindings from a file'],
-    ['quit', 'Quit the REPL'],
-    ['save', 'Save the current bindings to a file'],
+    ['ast', '<expr>', 'print the AST of the expression'],
+    ['debug', '<expr>', 'Step debug the evaluation of an expression'],
+    ['delete', '<name>', 'delete a binding by name'],
+    ['edit', '[path]', 'Edit current active file. Reload it on exit.'],
+    ['help', '', 'print this help message'],
+    ['list', '[names...]', 'list the bindings'],
+    ['load', '[path]', 'Load/reload bindings from a file.'],
+    ['quit', '', 'quit the REPL'],
+    ['save', '[path]', 'Save current bindings to a file.'],
+    ['set', '<key> <value>', 'Set a setting: `debruijn` controls variable output, `unicode` prints λ, `shorthand` elides chained lambdas.'],
 ];
+
+// [key, detail]. The values a key accepts are completed from its own table.
+const SETTINGS = [
+    ['debruijn', 'Variable output mode'],
+    ['unicode', 'Lambda output symbol'],
+    ['shorthand', 'Elide chained lambda symbols'],
+];
+
+const DEBRUIJN_MODES = [
+    ['off', 'Print bound variables by the name of their binder'],
+    ['on', 'Print bound variables as indices, keeping binder names'],
+    ['full', 'Print anonymous binders and every variable as an index'],
+];
+
+const UNICODE_MODES = [
+    ['off', 'Print binders with \\'],
+    ['on', 'Print binders with λ'],
+];
+
+const SHORTHAND_MODES = [
+    ['off', 'Print every binder with its own lambda symbol'],
+    ['on', 'Print chained named binders as \\x.y.body'],
+];
+
+const SETTING_MODES = new Map([
+    ['debruijn', DEBRUIJN_MODES],
+    ['unicode', UNICODE_MODES],
+    ['shorthand', SHORTHAND_MODES],
+]);
+
+const COMMANDS_BY_NAME = new Map(COMMAND_COMPLETIONS.map(command => [command[0], command]));
 
 const MAGIC_COMPLETIONS = [
     ['trace', 'Print the reduced argument and return it'],
@@ -281,46 +315,12 @@ function completionWord(line, character) {
 }
 
 /**
+ * Binding completions for the current document and std.lamb.
  * @param {vscode.TextDocument} document
- * @param {vscode.Position} position
+ * @param {vscode.Range} range
  */
-function provideCompletionItems(document, position) {
-    const line = document.lineAt(position.line).text;
-    if (line.slice(0, position.character).includes('//')) {
-        return undefined;
-    }
-
-    const { start, prefix } = completionWord(line, position.character);
-    // Require at least one typed character, so plain Tab still indents.
-    if (prefix.length === 0) {
-        return undefined;
-    }
-
-    const range = new vscode.Range(position.line, start, position.line, position.character);
+function bindingCompletionItems(document, range) {
     const items = [];
-
-    if (prefix.startsWith(':')) {
-        for (const [name, description] of COMMAND_COMPLETIONS) {
-            const item = new vscode.CompletionItem(':' + name, vscode.CompletionItemKind.Keyword);
-            item.range = range;
-            item.detail = description;
-            item.sortText = '0' + name;
-            items.push(item);
-        }
-        return items;
-    }
-
-    if (prefix.startsWith('#')) {
-        for (const [name, description] of MAGIC_COMPLETIONS) {
-            const item = new vscode.CompletionItem('#' + name, vscode.CompletionItemKind.Function);
-            item.range = range;
-            item.detail = description;
-            item.sortText = '0' + name;
-            items.push(item);
-        }
-        return items;
-    }
-
     const seen = new Set();
     const add = (name, detail) => {
         if (seen.has(name)) {
@@ -343,6 +343,173 @@ function provideCompletionItems(document, position) {
         }
     }
 
+    return items;
+}
+
+/**
+ * Derives what a command's argument means from its `:help` signature. Returns
+ * undefined when the signature gives no meaningful completion, such as a file
+ * path or no argument at all.
+ * @param {string} signature
+ */
+function argumentKind(signature) {
+    const argument = signature.trim();
+    if (argument === '[on|off|full]') {
+        return 'mode';
+    }
+    if (argument === '<key> <value>') {
+        return 'set';
+    }
+    if (argument === '<name>') {
+        return 'name';
+    }
+    if (argument === '[names...]') {
+        return 'names';
+    }
+    if (argument === '<expr>') {
+        return 'expr';
+    }
+    return undefined;
+}
+
+/**
+ * Detects a `:command ` prefix before the cursor and describes the argument
+ * being typed. Returns undefined when the cursor is not in command arguments.
+ * @param {string} line
+ * @param {number} character
+ */
+function commandArgumentAt(line, character) {
+    const match = /^\s*:([\p{L}\p{N}_?'-]+)\s+/u.exec(line.slice(0, character));
+    if (!match) {
+        return undefined;
+    }
+
+    // An unknown command still means the typed word is an argument, not a
+    // binding, so do not fall back to expression completion.
+    const command = COMMANDS_BY_NAME.get(match[1]);
+    const kind = command ? argumentKind(command[1]) : undefined;
+    if (!kind) {
+        return { kind: undefined };
+    }
+
+    // Everything after `:command ` split into completed arguments and the word
+    // currently under the cursor. The last word is always the current one.
+    const rest = line.slice(match[0].length, character);
+    const words = rest.length === 0 ? [''] : rest.split(/\s+/u);
+    return { kind, completed: words.length - 1, args: words.slice(0, -1) };
+}
+
+/**
+ * @param {vscode.Range} range
+ * @param {string[][]} modes
+ */
+function modeCompletionItems(range, modes) {
+    return modes.map(([name, description]) => {
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Keyword);
+        item.range = range;
+        item.detail = description;
+        item.sortText = '0' + name;
+        return item;
+    });
+}
+
+/**
+ * @param {vscode.Range} range
+ */
+function settingCompletionItems(range) {
+    return SETTINGS.map(([name, description]) => {
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Keyword);
+        item.range = range;
+        item.detail = description;
+        item.sortText = '0' + name;
+        return item;
+    });
+}
+
+/**
+ * @param {vscode.TextDocument} document
+ * @param {vscode.Position} position
+ */
+function provideCompletionItems(document, position) {
+    const line = document.lineAt(position.line).text;
+    if (line.slice(0, position.character).includes('//')) {
+        return undefined;
+    }
+
+    const argument = commandArgumentAt(line, position.character);
+    if (argument) {
+        const { start, prefix } = completionWord(line, position.character);
+        const range = new vscode.Range(position.line, start, position.line, position.character);
+
+        if (argument.kind === undefined) {
+            // File paths and commands without arguments have nothing to suggest.
+            return undefined;
+        }
+        if (argument.kind === 'mode') {
+            if (argument.completed > 0) {
+                return undefined;
+            }
+            return modeCompletionItems(range, DEBRUIJN_MODES);
+        }
+        if (argument.kind === 'set') {
+            if (argument.completed === 0) {
+                return settingCompletionItems(range);
+            }
+            const modes = argument.completed === 1
+                ? SETTING_MODES.get(argument.args[0])
+                : undefined;
+            return modes ? modeCompletionItems(range, modes) : undefined;
+        }
+        if (argument.kind === 'name' && argument.completed > 0) {
+            return undefined;
+        }
+
+        const items = bindingCompletionItems(document, range);
+        if (argument.kind === 'expr' && prefix.startsWith('#')) {
+            for (const [name, description] of MAGIC_COMPLETIONS) {
+                const item = new vscode.CompletionItem('#' + name, vscode.CompletionItemKind.Function);
+                item.range = range;
+                item.detail = description;
+                items.push(item);
+            }
+        }
+        return items.length > 0 ? items : undefined;
+    }
+
+    const { start, prefix } = completionWord(line, position.character);
+    // Require at least one typed character, so plain Tab still indents.
+    if (prefix.length === 0) {
+        return undefined;
+    }
+
+    const range = new vscode.Range(position.line, start, position.line, position.character);
+
+    if (prefix.startsWith(':')) {
+        const items = [];
+        for (const [name, signature, description] of COMMAND_COMPLETIONS) {
+            const item = new vscode.CompletionItem(':' + name, vscode.CompletionItemKind.Keyword);
+            item.range = range;
+            item.detail = signature ? `:${name} ${signature}` : `:${name}`;
+            item.documentation = description;
+            item.sortText = '0' + name;
+            items.push(item);
+        }
+        return items;
+    }
+
+    if (prefix.startsWith('#')) {
+        const items = [];
+        for (const [name, description] of MAGIC_COMPLETIONS) {
+            const item = new vscode.CompletionItem('#' + name, vscode.CompletionItemKind.Function);
+            item.range = range;
+            item.detail = description;
+            item.sortText = '0' + name;
+            items.push(item);
+        }
+        return items;
+    }
+
+    const items = bindingCompletionItems(document, range);
     return items.length > 0 ? items : undefined;
 }
 

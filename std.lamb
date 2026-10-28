@@ -1,12 +1,6 @@
 id    x   = x;
 const x _ = x;
 
-omega x = x x;
-Omega = omega omega;
-
-Y f = omega (\x. f (x x));
-Z f = omega (\x. f(\v. x x v));
-
 // CBool : a -> a -> a
 tru t f = t;
 fls t f = f;
@@ -16,14 +10,14 @@ not p   = p fls tru;
 xor p q = p (not q) q;
 
 // Pair : a -> a -> CBool -> a
-pair x y b = b x y;
+pair x y p = p x y;
 fst p = p tru;
 snd p = p fls;
 step f p = pair (f (fst p)) (fst p);
 
 // CNat : (a -> a) -> a -> a
-zero f x = x;
-succ n f x = f (n f x);
+zero   f z = z;
+succ n f z = f (n f z);
 one   = succ zero;
 two   = succ one;
 three = succ two;
@@ -39,15 +33,59 @@ is-even n = n not tru;
 add m n = n succ m;
 mul m n = n (add m) zero;
 pow m n = n (mul m) one;
-sub m n = n pred m;
 pred n = snd (n (step succ) (pair zero zero));
+sub m n = n pred m;
+is-odd n = n not fls;
+le m n = is-zero (sub m n);
+lt m n = le (succ m) n;
+ge m n = le n m;
+gt m n = lt n m;
+eqb m n = and (le m n) (le n m);
+min m n = sub m (sub m n);
+max m n = add n (sub m n);
+// Long division, one unit of the dividend per step. The accumulator pair is
+// destructured exactly once per step: touching it through fst/snd more than
+// once re-evaluates the whole step chain, which is exponential here since this
+// evaluator does not share normal-order reductions.
+div-step n p = p (λq.r. eqb (succ r) n
+                           (pair (succ q) zero)
+                           (pair q (succ r)));
+// div-mod m n = pair quotient remainder, computed in m steps; n must be non-zero.
+div-mod m n = m (div-step n) (pair zero zero);
+div m n = fst (div-mod m n);
+mod m n = snd (div-mod m n);
 
 // CList a : (a → r → r) → r → r
-nil c n = n;
-is-nil xs = xs (\_. _. fls) tru;
-cons x xs c n = c x (xs c n);
+nil       f z = z;
+cons x xs f z = f x (xs f z);
+is-nil xs = xs (λ..fls) tru;
 length xs = xs (const succ) zero;
 head xs = xs const nil;
-tail xs = snd (l (\h. step (cons h)) (pair nil nil));
+tail xs = snd (xs (λh. step (cons h)) (pair nil nil));
+reverse xs = xs (λx.acc.ys. acc (cons x ys)) id nil;
 
-trace_list = Y \rec. \xs. isnil xs nil (cons (#trace (head xs))) (rec (tail xs));
+append xs ys = xs cons ys;
+singleton x = cons x nil;
+snoc xs x = append xs (singleton x);
+map f xs = xs (λx.acc. cons (f x) acc) nil;
+filter p xs = xs (λx.acc. p x (cons x acc) acc) nil;
+foldr f z xs = xs f z;
+foldl f z xs = xs (λx.g.z'. g (f z' x)) id z;
+any p xs = xs (λx.acc. p x tru acc) fls;
+all p xs = xs (λx.acc. p x acc fls) tru;
+sum xs = xs add zero;
+product xs = xs mul one;
+concat xss = xss append nil;
+count p xs = length (filter p xs);
+// elem? takes a curried equality predicate, for example `eqb`.
+elem? eq x xs = any (eq x) xs;
+// partition returns a pair of (matching, non-matching) lists.
+partition p xs = pair (filter p xs) (filter (λx. not (p x)) xs);
+replicate n x = n (cons x) nil;
+drop n xs = n tail xs;
+nth n xs = head (drop n xs);
+// The fold cannot stop early, so take trims from the reversed end.
+take n xs = reverse (drop (sub (length xs) n) (reverse xs));
+last xs = head (reverse xs);
+init xs = reverse (tail (reverse xs));
+split-at n xs = pair (take n xs) (drop n xs);

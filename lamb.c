@@ -18,12 +18,14 @@
 #    define _WINUSER_
 #    define _WINGDI_
 #    define _IMM_
-#    define _WINCON_
 #    include <windows.h>
+#    include <conio.h>
 #else
 #    include <unistd.h>
 #    include <sys/wait.h>
 #    include <sys/stat.h>
+#    include <termios.h>
+#    include <sys/select.h>
 #endif // _WIN32
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -444,8 +446,15 @@ typedef enum {
     DEBRUIJN_FULL,
 } Debruijn_Mode;
 
-// Selected by the `:debruijn` command.
+// Selected by the `:set debruijn` command.
 static Debruijn_Mode debruijn_mode = DEBRUIJN_OFF;
+
+// Selected by the `:set unicode` command.
+static bool unicode_mode = false;
+
+// Selected by the `:set shorthand` command. When enabled, chained named
+// binders are printed in the `\x.y.body` shorthand accepted by the parser.
+static bool shorthand_mode = false;
 
 const char *debruijn_mode_name(Debruijn_Mode mode)
 {
@@ -455,6 +464,13 @@ const char *debruijn_mode_name(Debruijn_Mode mode)
     case DEBRUIJN_FULL: return "FULL";
     default: UNREACHABLE("Debruijn_Mode");
     }
+}
+
+// The operator printed for binders. `λ` is valid input as well, so output
+// produced in Unicode mode can be loaded back.
+const char *lambda_symbol(void)
+{
+    return unicode_mode ? "\xce\xbb" : "\\";
 }
 
 typedef struct {
@@ -548,19 +564,33 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
         }
     } break;
     case EXPR_FUN: {
-        const char *param = expr_slot(expr).as.fun.param;
-        const char *name = debruijn_mode == DEBRUIJN_FULL
-            ? NULL
-            : display_binder_name(param, expr_slot(expr).as.fun.body);
-        sb_appendf(sb, "\\");
-        if (name) {
-            sb_appendf(sb, "%s.", name);
-        } else {
-            sb_appendf(sb, ".");
+        size_t pushed = 0;
+        bool first = true;
+        // Walk the whole chain of binders so that `:set shorthand` can omit
+        // the symbol of every binder after the first one. The elided form is
+        // the same shorthand the parser accepts for named and anonymous
+        // binders alike.
+        while (expr_slot(expr).kind == EXPR_FUN) {
+            const char *param = expr_slot(expr).as.fun.param;
+            Expr_Index body = expr_slot(expr).as.fun.body;
+            const char *name = debruijn_mode == DEBRUIJN_FULL
+                ? NULL
+                : display_binder_name(param, body);
+            if (!shorthand_mode || first) {
+                sb_appendf(sb, "%s", lambda_symbol());
+            }
+            if (name) {
+                sb_appendf(sb, "%s.", name);
+            } else {
+                sb_appendf(sb, ".");
+            }
+            da_append(stack, name);
+            pushed++;
+            expr = body;
+            first = false;
         }
-        da_append(stack, name);
-        expr_display_scope(expr_slot(expr).as.fun.body, sb, stack, free_names);
-        stack->count -= 1;
+        expr_display_scope(expr, sb, stack, free_names);
+        stack->count -= pushed;
     } break;
     case EXPR_APP: {
         Expr_Index lhs = expr_slot(expr).as.app.lhs;
@@ -643,9 +673,9 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
             ? NULL
             : display_binder_name(param, expr_slot(expr).as.fun.body);
         if (name) {
-            printf("[FUN] \\%s\n", name);
+            printf("[FUN] %s%s\n", lambda_symbol(), name);
         } else {
-            printf("[FUN] \\.\n");
+            printf("[FUN] %s.\n", lambda_symbol());
         }
         da_append(binders, name);
         da_append(&stack, false); {
@@ -679,11 +709,19 @@ void dump_expr_ast(Expr_Index expr)
     dump_expr_ast_scope(expr, &binders, &free_names);
 }
 
+// The binders the evaluator is currently under. eval1() pushes a binder while
+// it normalizes that function's body, so that a `#trace` inside the body can
+// print bound variables by name instead of asserting on an index that has no
+// entry in the display stack.
+static Binder_Stack eval_binders = {0};
+
 void trace_expr(Expr_Index expr)
 {
     static String_Builder sb = {0};
+    static Free_Name_Stack free_names = {0};
     sb.count = 0;
-    expr_display(expr, &sb);
+    free_names.count = 0;
+    expr_display_scope(expr, &sb, &eval_binders, &free_names);
     sb_append_null(&sb);
     printf("%s", sb.items);
 }
@@ -788,9 +826,18 @@ bool eval1(Expr_Index expr, Expr_Index *expr1)
         return true;
     case EXPR_FUN: {
         Expr_Index body;
-        if (!eval1(expr_slot(expr).as.fun.body, &body)) return false;
+        const char *param = expr_slot(expr).as.fun.param;
+        // Only the OFF mode prints names; the other modes print indices, so
+        // they don't need the (potentially expensive) capture check.
+        const char *name = debruijn_mode == DEBRUIJN_OFF
+            ? display_binder_name(param, expr_slot(expr).as.fun.body)
+            : NULL;
+        da_append(&eval_binders, name);
+        bool ok = eval1(expr_slot(expr).as.fun.body, &body);
+        eval_binders.count -= 1;
+        if (!ok) return false;
         if (body.unwrap != expr_slot(expr).as.fun.body.unwrap) {
-            *expr1 = fun(expr_slot(expr).as.fun.param, body);
+            *expr1 = fun(param, body);
         } else {
             *expr1 = expr;
         }
@@ -983,6 +1030,32 @@ size_t decode_utf8(const char *s, size_t n, uint32_t *cp)
 
     *cp = value;
     return len;
+}
+
+// Encodes one Unicode code point as UTF-8. `out` must have room for 4 bytes.
+// Returns the number of bytes written.
+size_t encode_utf8(uint32_t cp, unsigned char out[4])
+{
+    if (cp < 0x80) {
+        out[0] = (unsigned char) cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (unsigned char) (0xC0 | (cp >> 6));
+        out[1] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (unsigned char) (0xE0 | (cp >> 12));
+        out[1] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (unsigned char) (0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (unsigned char) (0xF0 | (cp >> 18));
+    out[1] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (unsigned char) (0x80 | (cp & 0x3F));
+    return 4;
 }
 
 // Counts characters in a byte slice, treating every invalid byte as one
@@ -1245,7 +1318,9 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
         return false;
     }
 
-    // NOTE: `\x.y.body` means `\x.\y.body`
+    // NOTE: `\x.y.body` means `\x.\y.body`, and `\..body` means `\.\.body`.
+    // A `.` cannot start an expression, so treating it as another anonymous
+    // binder is unambiguous.
     bool shorthand = false;
     {
         Cur cur = l->cur;
@@ -1253,6 +1328,8 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
         if (l->token == TOKEN_NAME) {
             if (!lexer_next(l)) return false;
             shorthand = l->token == TOKEN_DOT;
+        } else if (l->token == TOKEN_DOT) {
+            shorthand = true;
         }
         l->cur = cur;
     }
@@ -1367,45 +1444,51 @@ typedef struct {
     const char *description;
 } Command;
 
-typedef struct {
-    Command *items;
-    size_t count;
-    size_t capacity;
-} Commands;
+// Single source of truth for the commands shown by `:help` and for the REPL's
+// Tab completion. The extension mirrors this list.
+static const Command COMMANDS[] = {
+    {"load",      "[path]",        "Load/reload bindings from a file."},
+    {"save",      "[path]",        "Save current bindings to a file."},
+    {"edit",      "[path]",        "Edit current active file. Reload it on exit."},
+    {"list",      "[names...]",    "list the bindings"},
+    {"delete",    "<name>",        "delete a binding by name"},
+    {"debug",     "<expr>",        "Step debug the evaluation of an expression"},
+    {"set",       "<key> <value>",  "Set a setting: `debruijn` controls variable output, `unicode` prints λ, `shorthand` elides chained lambdas."},
+    {"ast",       "<expr>",        "print the AST of the expression"},
+    {"quit",      "",              "quit the REPL"},
+    {"help",      "",              "print this help message"},
+};
+#define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 
-bool command(Commands *commands, const char *input, const char *name, const char *signature, const char *description)
+bool command(const char *input, const char *name)
 {
-    Command command = {
-        .name        = name,
-        .signature   = signature,
-        .description = description,
-    };
-    da_append(commands, command);
-    while (*input && *name && *input == *name) {
-        input++;
-        name++;
-    }
-    return *input == '\0';
+    return strcmp(input, name) == 0;
 }
 
-void print_available_commands(Commands *commands)
+const Command *find_command(const char *name)
+{
+    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
+        if (strcmp(COMMANDS[i].name, name) == 0) return &COMMANDS[i];
+    }
+    return NULL;
+}
+
+void print_available_commands(void)
 {
     printf("Available commands:\n");
-    int max_name_width = 0;
-    int max_sig_width = 0;
-    for (size_t i = 0; i < commands->count; ++i) {
-        Command command = commands->items[i];
-        int name_width  = strlen(command.name);
-        int sig_width   = strlen(command.signature);
+    size_t max_name_width = 0;
+    size_t max_sig_width = 0;
+    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
+        size_t name_width = strlen(COMMANDS[i].name);
+        size_t sig_width  = strlen(COMMANDS[i].signature);
         if (name_width > max_name_width) max_name_width = name_width;
         if (sig_width  > max_sig_width)  max_sig_width  = sig_width;
     }
-    for (size_t i = 0; i < commands->count; ++i) {
-        Command command = commands->items[i];
+    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
         printf("  :%-*s %-*s - %s\n",
-               max_name_width, command.name,
-               max_sig_width,  command.signature,
-               command.description);
+               (int) max_name_width, COMMANDS[i].name,
+               (int) max_sig_width,  COMMANDS[i].signature,
+               COMMANDS[i].description);
     }
 }
 
@@ -1513,6 +1596,793 @@ void ctrl_c_handler(int signum)
     ctrl_c = 1;
 }
 
+// ---------------------------------------------------------------------------
+// Line editing and Tab completion for the REPL.
+//
+// The REPL reads keys itself so that Tab can complete commands and binding
+// names. Completion follows the command signatures in COMMANDS: `:help `
+// has no arguments, `:set debruijn ` offers modes, `:delete ` and `:list `
+// offer names, `:ast ` and `:debug ` offer expression atoms, and path
+// arguments (`:load`, `:save`, `:edit`) are left alone.
+// ---------------------------------------------------------------------------
+
+typedef enum {
+    ARG_NONE,
+    ARG_MODE,
+    ARG_NAME,
+    ARG_NAMES,
+    ARG_EXPR,
+    ARG_SET,
+} Arg_Kind;
+
+Arg_Kind command_arg_kind(const char *signature)
+{
+    if (strcmp(signature, "[on|off|full]") == 0)            return ARG_MODE;
+    if (strcmp(signature, "<key> <value>") == 0)            return ARG_SET;
+    if (strcmp(signature, "<name>") == 0)                   return ARG_NAME;
+    if (strcmp(signature, "[names...]") == 0)               return ARG_NAMES;
+    if (strcmp(signature, "<expr>") == 0)                   return ARG_EXPR;
+    return ARG_NONE;
+}
+
+typedef struct {
+    char *data;
+    size_t size;
+    size_t count;
+    size_t cursor;
+} Input_Line;
+
+typedef enum {
+    INPUT_OK,
+    INPUT_EOF,
+    INPUT_ERROR,
+} Input_Status;
+
+size_t prev_codepoint(const char *s, size_t pos)
+{
+    if (pos == 0) return 0;
+    --pos;
+    while (pos > 0 && ((unsigned char) s[pos] & 0xC0) == 0x80) --pos;
+    return pos;
+}
+
+size_t next_codepoint(const char *s, size_t count, size_t pos)
+{
+    if (pos >= count) return count;
+    ++pos;
+    while (pos < count && ((unsigned char) s[pos] & 0xC0) == 0x80) ++pos;
+    return pos;
+}
+
+void line_set(Input_Line *line, const char *text)
+{
+    size_t n = strlen(text);
+    if (n >= line->size) n = line->size - 1;
+    memcpy(line->data, text, n);
+    line->data[n] = '\0';
+    line->count = n;
+    line->cursor = n;
+}
+
+bool line_insert(Input_Line *line, const char *bytes, size_t n)
+{
+    if (line->count + n >= line->size) return false;
+    memmove(line->data + line->cursor + n,
+            line->data + line->cursor,
+            line->count - line->cursor);
+    memcpy(line->data + line->cursor, bytes, n);
+    line->count += n;
+    line->cursor += n;
+    line->data[line->count] = '\0';
+    return true;
+}
+
+void line_delete(Input_Line *line, size_t from, size_t to)
+{
+    if (to > line->count) to = line->count;
+    if (from >= to) return;
+    memmove(line->data + from, line->data + to, line->count - to);
+    line->count -= to - from;
+    if (line->cursor > to) {
+        line->cursor -= to - from;
+    } else if (line->cursor > from) {
+        line->cursor = from;
+    }
+    line->data[line->count] = '\0';
+}
+
+// Repaints the prompt and the line, then moves the terminal cursor back to
+// `line->cursor`. Only `\r` and `\b` are used for positioning so the editor
+// works in a plain Windows console as well as in ANSI terminals.
+void line_render(const char *prompt, const Input_Line *line, size_t *rendered_columns)
+{
+    size_t prompt_width = count_chars(prompt, strlen(prompt));
+    size_t columns = prompt_width + count_chars(line->data, line->count);
+    size_t cursor_columns = prompt_width + count_chars(line->data, line->cursor);
+
+    putchar('\r');
+    fputs(prompt, stdout);
+    if (line->count > 0) fwrite(line->data, 1, line->count, stdout);
+
+    for (size_t i = columns; i < *rendered_columns; ++i) putchar(' ');
+    for (size_t i = columns; i < *rendered_columns; ++i) putchar('\b');
+    for (size_t i = cursor_columns; i < columns; ++i) putchar('\b');
+
+    fflush(stdout);
+    *rendered_columns = columns;
+}
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} History;
+
+static History history = {0};
+
+void history_add(const char *text)
+{
+    if (*text == '\0') return;
+    if (history.count > 0 && strcmp(history.items[history.count - 1], text) == 0) return;
+    da_append(&history, copy_string(text));
+    if (history.count > 100) {
+        free(history.items[0]);
+        da_delete_at(&history, 0);
+    }
+}
+
+bool stdin_is_interactive(void)
+{
+#ifdef _WIN32
+    // A pipe (for example under mintty) is not a console: `_getwch` cannot
+    // read it, so leave that case to `fgets`.
+    DWORD mode = 0;
+    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0;
+#endif
+}
+
+#ifndef _WIN32
+static struct termios saved_termios;
+static bool termios_saved = false;
+
+bool terminal_enter_raw(void)
+{
+    if (tcgetattr(STDIN_FILENO, &saved_termios) < 0) return false;
+    struct termios raw = saved_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) return false;
+    termios_saved = true;
+    return true;
+}
+
+void terminal_leave_raw(void)
+{
+    if (termios_saved) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        termios_saved = false;
+    }
+}
+#else
+static DWORD saved_console_mode = 0;
+static bool console_mode_saved = false;
+
+bool terminal_enter_raw(void)
+{
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (!GetConsoleMode(input, &saved_console_mode)) return false;
+    // Disable processed input so Ctrl+C arrives as a key press instead of
+    // terminating the process: `_getwch` then returns 3.
+    DWORD mode = saved_console_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    if (!SetConsoleMode(input, mode)) return false;
+    console_mode_saved = true;
+    return true;
+}
+
+void terminal_leave_raw(void)
+{
+    if (console_mode_saved) {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved_console_mode);
+        console_mode_saved = false;
+    }
+}
+#endif // _WIN32
+
+typedef enum {
+    KEY_CHAR,
+    KEY_ENTER,
+    KEY_BACKSPACE,
+    KEY_DELETE,
+    KEY_LEFT,
+    KEY_RIGHT,
+    KEY_UP,
+    KEY_DOWN,
+    KEY_HOME,
+    KEY_END,
+    KEY_TAB,
+    KEY_CTRL_C,
+    KEY_CTRL_D,
+    KEY_CTRL_U,
+    KEY_EOF,
+    KEY_UNKNOWN,
+} Key_Kind;
+
+typedef struct {
+    Key_Kind kind;
+    unsigned char bytes[8];
+    size_t byte_count;
+} Key;
+
+#ifdef _WIN32
+Key input_read_key(void)
+{
+    Key key = {0};
+    // `_getwch` reads UTF-16 code units, which keeps non-ASCII names intact.
+    wint_t c = _getwch();
+    if (c == WEOF) {
+        key.kind = KEY_EOF;
+        return key;
+    }
+    if (c == 0 || c == 224) {
+        wint_t code = _getwch();
+        switch (code) {
+        case 72: key.kind = KEY_UP;       break;
+        case 80: key.kind = KEY_DOWN;     break;
+        case 75: key.kind = KEY_LEFT;     break;
+        case 77: key.kind = KEY_RIGHT;    break;
+        case 71: key.kind = KEY_HOME;     break;
+        case 79: key.kind = KEY_END;      break;
+        case 83: key.kind = KEY_DELETE;   break;
+        default: key.kind = KEY_UNKNOWN;  break;
+        }
+        return key;
+    }
+    switch (c) {
+    case '\r':
+    case '\n': key.kind = KEY_ENTER;     break;
+    case 8:
+    case 127:  key.kind = KEY_BACKSPACE; break;
+    case '\t': key.kind = KEY_TAB;       break;
+    case 3:    key.kind = KEY_CTRL_C;    break;
+    case 4:    key.kind = KEY_CTRL_D;    break;
+    case 21:   key.kind = KEY_CTRL_U;    break;
+    case 26:   key.kind = KEY_EOF;       break;
+    default:
+        if (c >= 32) {
+            uint32_t cp = (uint32_t) c;
+            if (c >= 0xD800 && c <= 0xDBFF) {
+                wint_t low = _getwch();
+                if (low >= 0xDC00 && low <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + ((uint32_t) low - 0xDC00);
+                } else {
+                    cp = 0xFFFD;
+                }
+            }
+            key.kind = KEY_CHAR;
+            key.byte_count = encode_utf8(cp, key.bytes);
+        } else {
+            key.kind = KEY_UNKNOWN;
+        }
+        break;
+    }
+    return key;
+}
+#else
+typedef enum {
+    BYTE_OK,
+    BYTE_EOF,
+    BYTE_INTERRUPTED,
+} Byte_Status;
+
+Byte_Status input_read_byte(unsigned char *byte)
+{
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, byte, 1);
+        if (n == 1) return BYTE_OK;
+        if (n < 0 && errno == EINTR) {
+            if (ctrl_c) {
+                ctrl_c = 0;
+                return BYTE_INTERRUPTED;
+            }
+            continue;
+        }
+        return BYTE_EOF;
+    }
+}
+
+bool input_wait_readable(int milliseconds)
+{
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(STDIN_FILENO, &set);
+    struct timeval timeout = {
+        .tv_sec = milliseconds / 1000,
+        .tv_usec = (milliseconds % 1000) * 1000,
+    };
+    return select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) > 0;
+}
+
+Key input_read_key(void)
+{
+    Key key = {0};
+    // A signal may have interrupted a helper like select() during an escape
+    // sequence instead of the main read().
+    if (ctrl_c) {
+        ctrl_c = 0;
+        key.kind = KEY_CTRL_C;
+        return key;
+    }
+    unsigned char c = 0;
+    Byte_Status status = input_read_byte(&c);
+    if (status == BYTE_INTERRUPTED) {
+        key.kind = KEY_CTRL_C;
+        return key;
+    }
+    if (status == BYTE_EOF) {
+        key.kind = KEY_EOF;
+        return key;
+    }
+
+    if (c == 27) {
+        // Escape sequence: arrows, Home, End, Delete.
+        if (!input_wait_readable(30)) {
+            key.kind = KEY_UNKNOWN;
+            return key;
+        }
+        unsigned char seq[8] = {0};
+        size_t n = 0;
+        for (;;) {
+            unsigned char b = 0;
+            if (input_read_byte(&b) != BYTE_OK) break;
+            if (n < sizeof(seq)) seq[n++] = b;
+            if (b != '[' && b != 'O' && !(b >= '0' && b <= '9') && b != ';') break;
+            if (n >= 2 && b >= 'A' && b <= 'Z') break;
+            if (!input_wait_readable(10)) break;
+        }
+        if (n == 0) {
+            key.kind = KEY_UNKNOWN;
+            return key;
+        }
+        switch (seq[n - 1]) {
+        case 'A': key.kind = KEY_UP;       break;
+        case 'B': key.kind = KEY_DOWN;     break;
+        case 'C': key.kind = KEY_RIGHT;    break;
+        case 'D': key.kind = KEY_LEFT;     break;
+        case 'H': key.kind = KEY_HOME;     break;
+        case 'F': key.kind = KEY_END;      break;
+        case '~':
+            if (n >= 2 && seq[n - 2] == '3')      key.kind = KEY_DELETE;
+            else if (n >= 2 && seq[n - 2] == '1') key.kind = KEY_HOME;
+            else if (n >= 2 && seq[n - 2] == '4') key.kind = KEY_END;
+            else                                  key.kind = KEY_UNKNOWN;
+            break;
+        default: key.kind = KEY_UNKNOWN; break;
+        }
+        return key;
+    }
+
+    switch (c) {
+    case '\r':
+    case '\n': key.kind = KEY_ENTER;     break;
+    case 8:
+    case 127:  key.kind = KEY_BACKSPACE; break;
+    case '\t': key.kind = KEY_TAB;       break;
+    case 3:    key.kind = KEY_CTRL_C;    break;
+    case 4:    key.kind = KEY_CTRL_D;    break;
+    case 21:   key.kind = KEY_CTRL_U;    break;
+    default:
+        if (c >= 32) {
+            key.kind = KEY_CHAR;
+            key.bytes[0] = c;
+            key.byte_count = 1;
+        } else {
+            key.kind = KEY_UNKNOWN;
+        }
+        break;
+    }
+    return key;
+}
+#endif // _WIN32
+
+bool is_completion_name_byte(unsigned char c)
+{
+    return is_ascii_alnum(c) || c == '_' || c == '?' || c == '-' || c == '\'' || c >= 0x80;
+}
+
+size_t completion_word_start(const Input_Line *line)
+{
+    size_t start = line->cursor;
+    while (start > 0 && is_completion_name_byte((unsigned char) line->data[start - 1])) {
+        --start;
+    }
+    if (start > 0 && (line->data[start - 1] == ':' || line->data[start - 1] == '#')) {
+        --start;
+    }
+    return start;
+}
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} Candidates;
+
+void candidates_add(Candidates *list, const char *text)
+{
+    for (size_t i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i], text) == 0) return;
+    }
+    da_append(list, copy_string(text));
+}
+
+void candidates_free(Candidates *list)
+{
+    for (size_t i = 0; i < list->count; ++i) free(list->items[i]);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+int candidate_cmp(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *) a, *(const char *const *) b);
+}
+
+void candidates_add_bindings(Candidates *out, const Bindings *bindings,
+                             const char *prefix, size_t prefix_len)
+{
+    for (size_t i = 0; i < bindings->count; ++i) {
+        const char *name = bindings->items[i].name;
+        if (prefix_len == 0 || strncmp(name, prefix, prefix_len) == 0) {
+            candidates_add(out, name);
+        }
+    }
+}
+
+static const char *const REPL_MAGICS[] = {"#trace", "#void"};
+
+void candidates_add_magics(Candidates *out, const char *prefix, size_t prefix_len)
+{
+    for (size_t i = 0; i < sizeof(REPL_MAGICS) / sizeof(REPL_MAGICS[0]); ++i) {
+        if (prefix_len == 0 || strncmp(REPL_MAGICS[i], prefix, prefix_len) == 0) {
+            candidates_add(out, REPL_MAGICS[i]);
+        }
+    }
+}
+
+void candidates_add_modes(Candidates *out, const char *prefix, size_t prefix_len,
+                          bool include_full)
+{
+    static const char *const modes[] = {"off", "on", "full"};
+    size_t count = include_full ? 3 : 2;
+    for (size_t i = 0; i < count; ++i) {
+        if (prefix_len == 0 || strncmp(modes[i], prefix, prefix_len) == 0) {
+            candidates_add(out, modes[i]);
+        }
+    }
+}
+
+typedef struct {
+    bool in_args;
+    Arg_Kind kind;
+    size_t args_start;
+    size_t completed;
+} Command_Context;
+
+Command_Context completion_command_context(const Input_Line *line, size_t word_start)
+{
+    Command_Context ctx = {0};
+    size_t i = 0;
+    while (i < word_start && is_ascii_space((unsigned char) line->data[i])) ++i;
+    if (i >= word_start || line->data[i] != ':') return ctx;
+
+    size_t name_start = i + 1;
+    size_t name_end = name_start;
+    while (name_end < line->cursor &&
+           is_completion_name_byte((unsigned char) line->data[name_end])) {
+        ++name_end;
+    }
+    if (name_end == name_start) return ctx;
+    // The cursor is still inside the command name.
+    if (name_end >= line->cursor) return ctx;
+    if (!is_ascii_space((unsigned char) line->data[name_end])) return ctx;
+
+    char name[64];
+    size_t name_len = name_end - name_start;
+    if (name_len >= sizeof(name)) return ctx;
+    memcpy(name, line->data + name_start, name_len);
+    name[name_len] = '\0';
+
+    ctx.in_args = true;
+    const Command *command = find_command(name);
+    ctx.kind = command ? command_arg_kind(command->signature) : ARG_NONE;
+
+    size_t j = name_end;
+    while (j < word_start && is_ascii_space((unsigned char) line->data[j])) ++j;
+    ctx.args_start = j;
+    while (j < word_start) {
+        while (j < word_start && is_ascii_space((unsigned char) line->data[j])) ++j;
+        if (j < word_start) {
+            ctx.completed++;
+            while (j < word_start && !is_ascii_space((unsigned char) line->data[j])) ++j;
+        }
+    }
+    return ctx;
+}
+
+bool completion_arg_equals(const Input_Line *line, const Command_Context *ctx, const char *text)
+{
+    size_t len = strlen(text);
+    if (ctx->args_start + len > line->cursor) return false;
+    if (strncmp(line->data + ctx->args_start, text, len) != 0) return false;
+    return ctx->args_start + len == line->cursor ||
+        is_ascii_space((unsigned char) line->data[ctx->args_start + len]);
+}
+
+void completion_candidates(const Input_Line *line, size_t word_start,
+                           const Bindings *bindings, Candidates *out)
+{
+    const char *prefix = line->data + word_start;
+    size_t prefix_len = line->cursor - word_start;
+    Command_Context ctx = completion_command_context(line, word_start);
+
+    if (ctx.in_args) {
+        if (ctx.kind == ARG_NONE) return;
+
+        if (ctx.kind == ARG_SET) {
+            if (ctx.completed == 0) {
+                static const char *const settings[] = {"debruijn", "unicode", "shorthand"};
+                for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
+                    if (prefix_len == 0 || strncmp(settings[i], prefix, prefix_len) == 0) {
+                        candidates_add(out, settings[i]);
+                    }
+                }
+                return;
+            }
+            if (ctx.completed > 1) return;
+            if (completion_arg_equals(line, &ctx, "unicode") ||
+                completion_arg_equals(line, &ctx, "shorthand")) {
+                candidates_add_modes(out, prefix, prefix_len, false);
+                return;
+            }
+            if (!completion_arg_equals(line, &ctx, "debruijn")) return;
+        } else if ((ctx.kind == ARG_MODE || ctx.kind == ARG_NAME) && ctx.completed > 0) {
+            return;
+        }
+
+        if (ctx.kind == ARG_MODE || ctx.kind == ARG_SET) {
+            candidates_add_modes(out, prefix, prefix_len, true);
+            return;
+        }
+        if (ctx.kind == ARG_EXPR && prefix_len > 0 && prefix[0] == '#') {
+            candidates_add_magics(out, prefix, prefix_len);
+            return;
+        }
+        candidates_add_bindings(out, bindings, prefix, prefix_len);
+        return;
+    }
+
+    // Not a command argument. Require a typed prefix so plain Tab in an empty
+    // line does not dump every binding.
+    if (prefix_len == 0) return;
+
+    if (prefix[0] == ':') {
+        for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
+            char text[64];
+            snprintf(text, sizeof(text), ":%s", COMMANDS[i].name);
+            if (strncmp(text, prefix, prefix_len) == 0) {
+                candidates_add(out, text);
+            }
+        }
+    } else if (prefix[0] == '#') {
+        candidates_add_magics(out, prefix, prefix_len);
+    } else {
+        candidates_add_bindings(out, bindings, prefix, prefix_len);
+    }
+}
+
+void complete_line(const char *prompt, Input_Line *line, const Bindings *bindings,
+                   size_t *rendered_columns)
+{
+    size_t word_start = completion_word_start(line);
+    Candidates candidates = {0};
+    completion_candidates(line, word_start, bindings, &candidates);
+
+    if (candidates.count == 0) {
+        putchar('\a');
+        fflush(stdout);
+        candidates_free(&candidates);
+        return;
+    }
+
+    qsort(candidates.items, candidates.count, sizeof(candidates.items[0]), candidate_cmp);
+
+    const char *prefix = line->data + word_start;
+    size_t prefix_len = line->cursor - word_start;
+
+    size_t common = strlen(candidates.items[0]);
+    for (size_t i = 1; i < candidates.count; ++i) {
+        size_t j = 0;
+        while (j < common && candidates.items[i][j] && candidates.items[0][j] == candidates.items[i][j]) {
+            ++j;
+        }
+        common = j;
+    }
+    if (common < prefix_len) common = prefix_len;
+
+    bool completing_command = prefix_len > 0 && prefix[0] == ':';
+    if (candidates.count == 1 || common > prefix_len) {
+        size_t replacement_len = candidates.count == 1
+            ? strlen(candidates.items[0])
+            : common;
+        line_delete(line, word_start, line->cursor);
+        line_insert(line, candidates.items[0], replacement_len);
+        if (candidates.count == 1 && completing_command) {
+            bool has_space = line->cursor < line->count &&
+                is_ascii_space((unsigned char) line->data[line->cursor]);
+            if (!has_space) line_insert(line, " ", 1);
+        }
+        line_render(prompt, line, rendered_columns);
+    } else {
+        // Ambiguous and no progress: list the candidates and redraw the line.
+        size_t max_width = 0;
+        for (size_t i = 0; i < candidates.count; ++i) {
+            size_t width = strlen(candidates.items[i]);
+            if (width > max_width) max_width = width;
+        }
+        size_t per_line = max_width > 16 ? 1 : 4;
+        printf("\r\n");
+        for (size_t i = 0; i < candidates.count; ++i) {
+            printf("  %-*s", (int) max_width, candidates.items[i]);
+            if ((i + 1) % per_line == 0 || i + 1 == candidates.count) printf("\n");
+        }
+        *rendered_columns = 0;
+        line_render(prompt, line, rendered_columns);
+    }
+
+    candidates_free(&candidates);
+}
+
+Input_Status input_read_line(const char *prompt, Bindings *bindings, char *buffer, size_t size)
+{
+    if (!stdin_is_interactive()) {
+        fputs(prompt, stdout);
+        fflush(stdout);
+        if (!fgets(buffer, (int) size, stdin)) {
+            return feof(stdin) ? INPUT_EOF : INPUT_ERROR;
+        }
+        size_t n = strlen(buffer);
+        while (n > 0 && (buffer[n - 1] == '\n' || buffer[n - 1] == '\r')) {
+            buffer[--n] = '\0';
+        }
+        return INPUT_OK;
+    }
+
+#ifndef _WIN32
+    ctrl_c = 0;
+#endif
+
+    Input_Line line = {
+        .data = buffer,
+        .size = size,
+    };
+    line_set(&line, "");
+
+    size_t rendered_columns = 0;
+    line_render(prompt, &line, &rendered_columns);
+
+    bool raw = terminal_enter_raw();
+    Input_Status status = INPUT_OK;
+    size_t history_index = 0;
+    char *draft = NULL;
+
+    for (;;) {
+        Key key = input_read_key();
+        switch (key.kind) {
+        case KEY_CHAR:
+            if (!line_insert(&line, (const char *) key.bytes, key.byte_count)) {
+                putchar('\a');
+            }
+            line_render(prompt, &line, &rendered_columns);
+            break;
+        case KEY_ENTER:
+            printf("\r\n");
+            history_add(line.data);
+            goto done;
+        case KEY_BACKSPACE:
+            if (line.cursor > 0) {
+                size_t from = prev_codepoint(line.data, line.cursor);
+                line_delete(&line, from, line.cursor);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_DELETE:
+            if (line.cursor < line.count) {
+                size_t to = next_codepoint(line.data, line.count, line.cursor);
+                line_delete(&line, line.cursor, to);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_LEFT:
+            if (line.cursor > 0) {
+                line.cursor = prev_codepoint(line.data, line.cursor);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_RIGHT:
+            if (line.cursor < line.count) {
+                line.cursor = next_codepoint(line.data, line.count, line.cursor);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_HOME:
+            line.cursor = 0;
+            line_render(prompt, &line, &rendered_columns);
+            break;
+        case KEY_END:
+            line.cursor = line.count;
+            line_render(prompt, &line, &rendered_columns);
+            break;
+        case KEY_UP:
+            if (history_index < history.count) {
+                if (history_index == 0) {
+                    free(draft);
+                    draft = copy_string(line.data);
+                }
+                history_index++;
+                line_set(&line, history.items[history.count - history_index]);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_DOWN:
+            if (history_index > 0) {
+                history_index--;
+                line_set(&line, history_index == 0
+                    ? (draft ? draft : "")
+                    : history.items[history.count - history_index]);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_TAB:
+            complete_line(prompt, &line, bindings, &rendered_columns);
+            break;
+        case KEY_CTRL_U:
+            line_delete(&line, 0, line.count);
+            line_render(prompt, &line, &rendered_columns);
+            break;
+        case KEY_CTRL_C:
+            printf("\r\n");
+            line_set(&line, "");
+            goto done;
+        case KEY_CTRL_D:
+            if (line.count == 0) {
+                printf("\r\n");
+                status = INPUT_EOF;
+                goto done;
+            }
+            if (line.cursor < line.count) {
+                size_t to = next_codepoint(line.data, line.count, line.cursor);
+                line_delete(&line, line.cursor, to);
+                line_render(prompt, &line, &rendered_columns);
+            }
+            break;
+        case KEY_EOF:
+            printf("\r\n");
+            status = INPUT_EOF;
+            goto done;
+        case KEY_UNKNOWN:
+            break;
+        }
+    }
+
+done:
+    free(draft);
+    if (raw) terminal_leave_raw();
+    return status;
+}
+
 void replace_active_file_path_from_lexer_if_not_empty(Lexer l, char **active_file_path)
 {
     const char *path_data = &l.content[l.cur.pos];
@@ -1534,7 +2404,6 @@ void replace_active_file_path_from_lexer_if_not_empty(Lexer l, char **active_fil
 int main(int argc, char **argv)
 {
     static char buffer[1024];
-    static Commands commands = {0};
     static Bindings bindings = {0};
     static Lexer l = {0};
 
@@ -1573,12 +2442,13 @@ int main(int argc, char **argv)
     printf("Enter :help for more info\n");
     for (;;) {
 again:
-        printf("@> ");
-        fflush(stdout);
-        if (!fgets(buffer, sizeof(buffer), stdin)) {
-            if (feof(stdin)) goto quit;
-            printf("\n");
-            goto again;
+        {
+            Input_Status status = input_read_line("@> ", &bindings, buffer, sizeof(buffer));
+            if (status == INPUT_EOF) goto quit;
+            if (status == INPUT_ERROR) {
+                printf("\n");
+                goto quit;
+            }
         }
         const char *source = buffer;
 
@@ -1589,8 +2459,7 @@ again:
         if (l.token == TOKEN_COLON) {
             if (!lexer_next(&l)) goto again;
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
-            commands.count = 0;
-            if (command(&commands, l.string.items, "load", "[path]", "Load/reload bindings from a file.")) {
+            if (command(l.string.items, "load")) {
                 replace_active_file_path_from_lexer_if_not_empty(l, &active_file_path);
                 if (active_file_path == NULL) {
                     fprintf(stderr, "ERROR: No active file to reload from. Do `:load <path>`.\n");
@@ -1601,7 +2470,7 @@ again:
                 create_bindings_from_file(active_file_path, &bindings);
                 goto again;
             }
-            if (command(&commands, l.string.items, "save", "[path]", "Save current bindings to a file.")) {
+            if (command(l.string.items, "save")) {
                 replace_active_file_path_from_lexer_if_not_empty(l, &active_file_path);
                 if (active_file_path == NULL) {
                     fprintf(stderr, "ERROR: No active file to save to. Do `:save <path>`.\n");
@@ -1633,7 +2502,7 @@ again:
                 printf("Saved all the bindings to %s\n", active_file_path);
                 goto again;
             }
-            if (command(&commands, l.string.items, "edit", "[path]", "Edit current active file. Reload it on exit.")) {
+            if (command(l.string.items, "edit")) {
 #ifdef _WIN32
                 fprintf(stderr, "TODO: editing files is not implemented on Windows yet! Sorry!\n");
 #else
@@ -1654,7 +2523,7 @@ again:
 #endif // _WIN32
                 goto again;
             }
-            if (command(&commands, l.string.items, "list", "[names...]", "list the bindings")) {
+            if (command(l.string.items, "list")) {
                 static String_Builder sb = {0};
                 static struct {
                     const char **items;
@@ -1707,7 +2576,7 @@ again:
 
                 goto again;
             }
-            if (command(&commands, l.string.items, "delete", "<name>", "delete a binding by name")) {
+            if (command(l.string.items, "delete")) {
                 if (!lexer_expect(&l, TOKEN_NAME)) goto again;
                 const char *name = intern_label(l.string.items);
                 for (size_t i = 0; i < bindings.count; ++i) {
@@ -1720,7 +2589,7 @@ again:
                 printf("ERROR: binding %s was not found\n", name);
                 goto again;
             }
-            if (command(&commands, l.string.items, "debug", "<expr>", "Step debug the evaluation of an expression")) {
+            if (command(l.string.items, "debug")) {
                 Expr_Index expr;
                 if (!parse_expr(&l, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
@@ -1763,42 +2632,80 @@ again:
 
                 goto again;
             }
-            if (command(&commands, l.string.items, "debruijn", "[on|off|full]", "Set variable output: names, indices, or fully nameless De Bruijn indices.")) {
+            if (command(l.string.items, "set")) {
+                if (!lexer_next(&l)) goto again;
+                if (l.token != TOKEN_NAME) {
+                    if (l.token != TOKEN_END) lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: Expected a setting name after :set. Try `:set debruijn on`.\n");
+                    goto again;
+                }
+                bool is_debruijn = strcmp(l.string.items, "debruijn") == 0;
+                bool is_unicode  = strcmp(l.string.items, "unicode") == 0;
+                bool is_shorthand = strcmp(l.string.items, "shorthand") == 0;
+                if (!is_debruijn && !is_unicode && !is_shorthand) {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: Unknown setting `%s`. Expected `debruijn`, `unicode`, or `shorthand`\n", l.string.items);
+                    goto again;
+                }
+                const char *key_name = is_debruijn ? "debruijn"
+                    : is_unicode ? "unicode"
+                    : "shorthand";
+
                 if (!lexer_next(&l)) goto again;
                 if (l.token == TOKEN_END) {
-                    debruijn_mode = debruijn_mode == DEBRUIJN_OFF
-                        ? DEBRUIJN_ON
-                        : DEBRUIJN_OFF;
+                    if (is_debruijn) {
+                        debruijn_mode = debruijn_mode == DEBRUIJN_OFF
+                            ? DEBRUIJN_ON
+                            : DEBRUIJN_OFF;
+                    } else if (is_unicode) {
+                        unicode_mode = !unicode_mode;
+                    } else {
+                        shorthand_mode = !shorthand_mode;
+                    }
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "on") == 0) {
-                    debruijn_mode = DEBRUIJN_ON;
+                    if (is_debruijn)       debruijn_mode  = DEBRUIJN_ON;
+                    else if (is_unicode)   unicode_mode   = true;
+                    else                   shorthand_mode = true;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "off") == 0) {
-                    debruijn_mode = DEBRUIJN_OFF;
+                    if (is_debruijn)       debruijn_mode  = DEBRUIJN_OFF;
+                    else if (is_unicode)   unicode_mode   = false;
+                    else                   shorthand_mode = false;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
-                } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "full") == 0) {
+                } else if (is_debruijn && l.token == TOKEN_NAME && strcmp(l.string.items, "full") == 0) {
                     debruijn_mode = DEBRUIJN_FULL;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else {
                     lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Expected `on`, `off`, `full`, or no argument after :debruijn\n");
+                    if (is_debruijn) {
+                        fprintf(stderr, "ERROR: Expected `on`, `off`, `full`, or no argument after :set debruijn\n");
+                    } else {
+                        fprintf(stderr, "ERROR: Expected `on`, `off`, or no argument after :set %s\n", key_name);
+                    }
                     goto again;
                 }
-                printf("De Bruijn indices output: %s\n", debruijn_mode_name(debruijn_mode));
+                if (is_debruijn) {
+                    printf("De Bruijn indices output: %s\n", debruijn_mode_name(debruijn_mode));
+                } else if (is_unicode) {
+                    printf("Unicode lambda output: %s\n", unicode_mode ? "ON" : "OFF");
+                } else {
+                    printf("Lambda shorthand output: %s\n", shorthand_mode ? "ON" : "OFF");
+                }
                 goto again;
             }
-            if (command(&commands, l.string.items, "ast", "<expr>", "print the AST of the expression")) {
+            if (command(l.string.items, "ast")) {
                 Expr_Index expr;
                 if (!parse_expr(&l, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 dump_expr_ast(expr);
                 goto again;
             }
-            if (command(&commands, l.string.items, "quit", "", "quit the REPL")) goto quit;
-            if (command(&commands, l.string.items, "help", "", "print this help message")) {
-                print_available_commands(&commands);
+            if (command(l.string.items, "quit")) goto quit;
+            if (command(l.string.items, "help")) {
+                print_available_commands();
                 goto again;
             }
-            print_available_commands(&commands);
+            print_available_commands();
             printf("ERROR: unknown command `%s`\n", l.string.items);
             goto again;
         }
