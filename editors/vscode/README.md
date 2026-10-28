@@ -1,13 +1,15 @@
 # Lamb for VS Code
 
-Syntax highlighting, language configuration and Lean-style Unicode input for [Lamb](https://github.com/tsoding/lamb).
+Syntax highlighting, completion, language configuration and Lean-style Unicode
+input for [Lamb](https://github.com/tsoding/lamb).
 
-A TextMate grammar plus a small Unicode input helper. No language server, no
-build step.
+A TextMate grammar plus a small completion and Unicode input helper. No language
+server, no build step.
 
 ## What it provides
 
 - Syntax highlighting for `.lamb` files
+- Completion for binding names, `:` commands, and `#` magics
 - Binding parameters (`plus n m = ...`) highlighted like lambda parameters
 - De Bruijn indices (`0`, `1`, ...) highlighted as numeric constants
 - Anonymous binders (`\.`) highlighted like other lambda binders
@@ -57,6 +59,25 @@ inside comments.
 The interpreter classifies non-ASCII name characters with the C library's
 `iswalnum` after selecting a UTF-8 locale when one is available, so the exact
 set can differ slightly from the grammar's Unicode classes.
+
+## Completion
+
+Completion suggests:
+
+- binding names defined in the current file and in the nearest `std.lamb`
+  (next to the file, or in a workspace folder);
+- REPL commands after `:`;
+- magics after `#` (`#trace`, `#void`).
+
+Type at least one character, then press **Tab** to accept the best match, or
+**Ctrl+Space** to pick from the list. The extension enables
+`editor.tabCompletion` for Lamb files by default, which you can override in your
+settings. An empty prefix returns no items, so Tab still indents normally. When
+a Unicode abbreviation is underlined, Tab converts the abbreviation instead.
+
+Completion is disabled inside `//` comments. Binding names are read from the
+current document and from `std.lamb`; other files in the workspace are not
+scanned. Binding definitions use `name = body`.
 
 ## Develop
 

@@ -14,6 +14,27 @@ const builtinTranslations = require('./abbreviations.json');
 
 const CONTEXT_KEY = 'lamb.input.isActive';
 const ABBREVIATION_CHAR = /[A-Za-z0-9_=<>!+\-*/^|]/;
+const NAME_CHAR = /[\p{L}\p{N}_?'-]/u;
+const DEFINITION_NAME = /^(?![\p{Nd}])[\p{L}\p{N}_?'-]+/u;
+
+const COMMAND_COMPLETIONS = [
+    ['ast', 'Print the AST of an expression'],
+    ['debruijn', 'Toggle printing of variables as De Bruijn indices'],
+    ['debug', 'Step through the evaluation of an expression'],
+    ['delete', 'Delete a binding by name'],
+    ['edit', 'Edit the active bindings file'],
+    ['help', 'Print the help message'],
+    ['list', 'List the bindings'],
+    ['load', 'Load or reload bindings from a file'],
+    ['quit', 'Quit the REPL'],
+    ['save', 'Save the current bindings to a file'],
+];
+
+const MAGIC_COMPLETIONS = [
+    ['trace', 'Print the reduced argument and return it'],
+    ['void', 'Force the argument and return #void'],
+];
+
 /** @type {vscode.TextEditorDecorationType | undefined} */
 let underlineDecoration;
 
@@ -177,6 +198,154 @@ async function convert(editor) {
     await updateState(editor);
 }
 
+/** @type {Map<string, { mtimeMs: number, names: string[] }>} */
+const fileDefinitionCache = new Map();
+
+/**
+ * Extracts the binding names defined in a Lamb source file.
+ * @param {string} text
+ */
+function definitionsInText(text) {
+    const names = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.split('//')[0];
+        for (const statement of line.split(';')) {
+            // Binding definitions use `name = body`.
+            const assign = statement.indexOf('=');
+            if (assign < 0) {
+                continue;
+            }
+            const match = DEFINITION_NAME.exec(statement.slice(0, assign).trim());
+            if (match) {
+                names.push(match[0]);
+            }
+        }
+    }
+    return names;
+}
+
+/**
+ * @param {string} file
+ */
+function definitionsInFile(file) {
+    try {
+        const mtimeMs = fs.statSync(file).mtimeMs;
+        const cached = fileDefinitionCache.get(file);
+        if (cached && cached.mtimeMs === mtimeMs) {
+            return cached.names;
+        }
+        const names = definitionsInText(fs.readFileSync(file, 'utf8'));
+        fileDefinitionCache.set(file, { mtimeMs, names });
+        return names;
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Looks for std.lamb next to the document, then in each workspace folder.
+ * @param {vscode.TextDocument} document
+ */
+function stdLambPath(document) {
+    const candidates = [];
+    if (document.uri.scheme === 'file') {
+        candidates.push(path.join(path.dirname(document.uri.fsPath), 'std.lamb'));
+    }
+    for (const folder of vscode.workspace.workspaceFolders || []) {
+        candidates.push(path.join(folder.uri.fsPath, 'std.lamb'));
+    }
+    return candidates.find(file => {
+        try {
+            return fs.statSync(file).isFile();
+        } catch {
+            return false;
+        }
+    });
+}
+
+/**
+ * Returns the completion range start and the text typed since it. A leading
+ * `:` or `#` is part of the range so command and magic completions replace it.
+ * @param {string} line
+ * @param {number} character
+ */
+function completionWord(line, character) {
+    let start = character;
+    while (start > 0 && NAME_CHAR.test(line[start - 1])) {
+        start -= 1;
+    }
+    if (start > 0 && (line[start - 1] === ':' || line[start - 1] === '#')) {
+        start -= 1;
+    }
+    return { start, prefix: line.slice(start, character) };
+}
+
+/**
+ * @param {vscode.TextDocument} document
+ * @param {vscode.Position} position
+ */
+function provideCompletionItems(document, position) {
+    const line = document.lineAt(position.line).text;
+    if (line.slice(0, position.character).includes('//')) {
+        return undefined;
+    }
+
+    const { start, prefix } = completionWord(line, position.character);
+    // Require at least one typed character, so plain Tab still indents.
+    if (prefix.length === 0) {
+        return undefined;
+    }
+
+    const range = new vscode.Range(position.line, start, position.line, position.character);
+    const items = [];
+
+    if (prefix.startsWith(':')) {
+        for (const [name, description] of COMMAND_COMPLETIONS) {
+            const item = new vscode.CompletionItem(':' + name, vscode.CompletionItemKind.Keyword);
+            item.range = range;
+            item.detail = description;
+            item.sortText = '0' + name;
+            items.push(item);
+        }
+        return items;
+    }
+
+    if (prefix.startsWith('#')) {
+        for (const [name, description] of MAGIC_COMPLETIONS) {
+            const item = new vscode.CompletionItem('#' + name, vscode.CompletionItemKind.Function);
+            item.range = range;
+            item.detail = description;
+            item.sortText = '0' + name;
+            items.push(item);
+        }
+        return items;
+    }
+
+    const seen = new Set();
+    const add = (name, detail) => {
+        if (seen.has(name)) {
+            return;
+        }
+        seen.add(name);
+        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
+        item.range = range;
+        item.detail = detail;
+        items.push(item);
+    };
+
+    for (const name of definitionsInText(document.getText())) {
+        add(name, 'binding in this file');
+    }
+    const std = stdLambPath(document);
+    if (std) {
+        for (const name of definitionsInFile(std)) {
+            add(name, 'binding from std.lamb');
+        }
+    }
+
+    return items.length > 0 ? items : undefined;
+}
+
 /**
  * @param {vscode.TextEditor | undefined} editor
  */
@@ -220,6 +389,11 @@ function activate(context) {
         underlineDecoration,
         vscode.commands.registerTextEditorCommand('lamb.input.convert', editor => convert(editor)),
         vscode.commands.registerTextEditorCommand('lamb.input.insertSymbol', editor => insertSymbol(editor)),
+        vscode.languages.registerCompletionItemProvider(
+            'lamb',
+            { provideCompletionItems },
+            '#',
+        ),
         vscode.window.onDidChangeActiveTextEditor(editor => updateState(editor)),
         vscode.window.onDidChangeTextEditorSelection(event => updateState(event.textEditor)),
         vscode.workspace.onDidChangeTextDocument(event => {

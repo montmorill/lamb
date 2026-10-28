@@ -1,7 +1,7 @@
 {
   "name": "lamb-language",
   "displayName": "Lamb",
-  "description": "Syntax highlighting and Lean-style Unicode input for the Lamb language.",
+  "description": "Syntax highlighting, completion and Lean-style Unicode input for the Lamb language.",
   "version": "0.4.0",
   "publisher": "montmorill",
   "license": "MIT",
@@ -47,6 +47,11 @@
         "when": "editorTextFocus && editorLangId == lamb"
       }
     ],
+    "configurationDefaults": {
+      "[lamb]": {
+        "editor.tabCompletion": "on"
+      }
+    },
     "configuration": {
       "title": "Lamb",
       "properties": {
@@ -66,7 +71,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Extra abbreviations, e.g. {\"foo\": \"\u263a\"} makes \\foo insert \u263a."
+          "description": "Extra abbreviations, e.g. {\"foo\": \"☺\"} makes \\foo insert ☺."
         }
       }
     },
