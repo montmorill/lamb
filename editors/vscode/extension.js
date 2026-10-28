@@ -19,7 +19,7 @@ const DEFINITION_NAME = /^(?![\p{Nd}])[\p{L}\p{N}_?'-]+/u;
 
 const COMMAND_COMPLETIONS = [
     ['ast', 'Print the AST of an expression'],
-    ['debruijn', 'Toggle printing of variables as De Bruijn indices'],
+    ['debruijn', 'Set variable output: names, indices, or fully nameless'],
     ['debug', 'Step through the evaluation of an expression'],
     ['delete', 'Delete a binding by name'],
     ['edit', 'Edit the active bindings file'],

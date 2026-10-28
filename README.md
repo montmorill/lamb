@@ -194,7 +194,7 @@ RESULT: \x.43
 
 Use names rather than numbers for constants and free values to avoid this shift.
 
-To print every bound variable as an index, use the `:debruijn` command. With no argument it toggles the current setting; `:debruijn on` and `:debruijn off` set it explicitly:
+To control how variables are printed, use the `:debruijn` command. With no argument it toggles between `off` and `on`; `:debruijn on`, `:debruijn off`, and `:debruijn full` set a mode explicitly:
 
 ```
 @> :debruijn
@@ -208,7 +208,23 @@ RESULT: \x.\y.x
 @>
 ```
 
-Forced mode also affects `:ast`, `:save`, and `:list` output.
+In `full` mode every binder is printed as `\.` and every variable occurrence as an index, so a closed term contains no names at all:
+
+```
+@> :debruijn full
+De Bruijn indices output: FULL
+@> \x.\y.x
+RESULT: \.\.1
+@> :ast \x.\y.x
+[FUN] \.
++--[FUN] \.
+   +--[VAR] 1
+@>
+```
+
+Free variables have no binder that could give them an index. They are numbered by their first appearance and printed like free indices (with the current binder depth added), so the output stays nameless even for open terms. For example, `foo bar` prints as `0 1`.
+
+All three modes affect `:ast`, `:save`, and `:list` output.
 
 ## Applications
 

@@ -434,9 +434,46 @@ typedef struct {
     size_t capacity;
 } Binder_Stack;
 
-// Toggled by the `:debruijn` command. When true every bound variable is
-// printed as an index instead of the name of its binder.
-static bool output_debruijn_indices = false;
+typedef enum {
+    // Print bound variables by the name of their binder when possible.
+    DEBRUIJN_OFF,
+    // Print every bound variable as an index, but keep binder names.
+    DEBRUIJN_ON,
+    // Print every binder as `\.` and every variable as an index, so the
+    // output contains no names at all.
+    DEBRUIJN_FULL,
+} Debruijn_Mode;
+
+// Selected by the `:debruijn` command.
+static Debruijn_Mode debruijn_mode = DEBRUIJN_OFF;
+
+const char *debruijn_mode_name(Debruijn_Mode mode)
+{
+    switch (mode) {
+    case DEBRUIJN_OFF:  return "OFF";
+    case DEBRUIJN_ON:   return "ON";
+    case DEBRUIJN_FULL: return "FULL";
+    default: UNREACHABLE("Debruijn_Mode");
+    }
+}
+
+typedef struct {
+    const char **items;
+    size_t count;
+    size_t capacity;
+} Free_Name_Stack;
+
+// Free variables have no binder that could give them an index. In FULL mode
+// they are numbered by first appearance instead, as if the free variables
+// formed an outer context. This is what makes the output completely nameless.
+size_t free_name_index(Free_Name_Stack *stack, const char *label)
+{
+    for (size_t i = 0; i < stack->count; ++i) {
+        if (stack->items[i] == label) return i;
+    }
+    da_append(stack, label);
+    return stack->count - 1;
+}
 
 bool has_free_name(Expr_Index expr, const char *label)
 {
@@ -487,18 +524,24 @@ bool bound_name_is_shadowed(Binder_Stack *stack, size_t index)
     return false;
 }
 
-void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack)
+void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack,
+                        Free_Name_Stack *free_names)
 {
     switch (expr_slot(expr).kind) {
     case EXPR_FREE_NAME:
-        sb_appendf(sb, "%s", expr_slot(expr).as.free_name);
+        if (debruijn_mode == DEBRUIJN_FULL) {
+            sb_appendf(sb, "%zu",
+                       stack->count + free_name_index(free_names, expr_slot(expr).as.free_name));
+        } else {
+            sb_appendf(sb, "%s", expr_slot(expr).as.free_name);
+        }
         break;
     case EXPR_FREE_INDEX:
         sb_appendf(sb, "%zu", stack->count + expr_slot(expr).as.free_index);
         break;
     case EXPR_BOUND: {
         size_t index = expr_slot(expr).as.bound;
-        if (!output_debruijn_indices && !bound_name_is_shadowed(stack, index)) {
+        if (debruijn_mode == DEBRUIJN_OFF && !bound_name_is_shadowed(stack, index)) {
             sb_appendf(sb, "%s", stack->items[stack->count - 1 - index]);
         } else {
             sb_appendf(sb, "%zu", index);
@@ -506,7 +549,9 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
     } break;
     case EXPR_FUN: {
         const char *param = expr_slot(expr).as.fun.param;
-        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
+        const char *name = debruijn_mode == DEBRUIJN_FULL
+            ? NULL
+            : display_binder_name(param, expr_slot(expr).as.fun.body);
         sb_appendf(sb, "\\");
         if (name) {
             sb_appendf(sb, "%s.", name);
@@ -514,14 +559,14 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
             sb_appendf(sb, ".");
         }
         da_append(stack, name);
-        expr_display_scope(expr_slot(expr).as.fun.body, sb, stack);
+        expr_display_scope(expr_slot(expr).as.fun.body, sb, stack, free_names);
         stack->count -= 1;
     } break;
     case EXPR_APP: {
         Expr_Index lhs = expr_slot(expr).as.app.lhs;
         bool lhs_paren = expr_slot(lhs).kind == EXPR_FUN;
         if (lhs_paren) sb_appendf(sb, "(");
-        expr_display_scope(lhs, sb, stack);
+        expr_display_scope(lhs, sb, stack, free_names);
         if (lhs_paren) sb_appendf(sb, ")");
 
         sb_appendf(sb, " ");
@@ -532,7 +577,7 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
                          expr_slot(rhs).kind != EXPR_FREE_INDEX &&
                          expr_slot(rhs).kind != EXPR_MAG;
         if (rhs_paren) sb_appendf(sb, "(");
-        expr_display_scope(rhs, sb, stack);
+        expr_display_scope(rhs, sb, stack, free_names);
         if (rhs_paren) sb_appendf(sb, ")");
     } break;
     case EXPR_MAG:
@@ -545,11 +590,14 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
 void expr_display(Expr_Index expr, String_Builder *sb)
 {
     static Binder_Stack stack = {0};
+    static Free_Name_Stack free_names = {0};
     stack.count = 0;
-    expr_display_scope(expr, sb, &stack);
+    free_names.count = 0;
+    expr_display_scope(expr, sb, &stack, &free_names);
 }
 
-void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
+void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
+                         Free_Name_Stack *free_names)
 {
     static struct {
         bool *items;
@@ -571,14 +619,19 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
 
     switch (expr_slot(expr).kind) {
     case EXPR_FREE_NAME:
-        printf("[VAR] %s\n", expr_slot(expr).as.free_name);
+        if (debruijn_mode == DEBRUIJN_FULL) {
+            printf("[VAR] %zu\n",
+                   binders->count + free_name_index(free_names, expr_slot(expr).as.free_name));
+        } else {
+            printf("[VAR] %s\n", expr_slot(expr).as.free_name);
+        }
         break;
     case EXPR_FREE_INDEX:
         printf("[VAR] %zu\n", binders->count + expr_slot(expr).as.free_index);
         break;
     case EXPR_BOUND: {
         size_t index = expr_slot(expr).as.bound;
-        if (!output_debruijn_indices && !bound_name_is_shadowed(binders, index)) {
+        if (debruijn_mode == DEBRUIJN_OFF && !bound_name_is_shadowed(binders, index)) {
             printf("[VAR] %s\n", binders->items[binders->count - 1 - index]);
         } else {
             printf("[VAR] %zu\n", index);
@@ -586,7 +639,9 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
     } break;
     case EXPR_FUN: {
         const char *param = expr_slot(expr).as.fun.param;
-        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
+        const char *name = debruijn_mode == DEBRUIJN_FULL
+            ? NULL
+            : display_binder_name(param, expr_slot(expr).as.fun.body);
         if (name) {
             printf("[FUN] \\%s\n", name);
         } else {
@@ -594,17 +649,17 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
         }
         da_append(binders, name);
         da_append(&stack, false); {
-            dump_expr_ast_scope(expr_slot(expr).as.fun.body, binders);
+            dump_expr_ast_scope(expr_slot(expr).as.fun.body, binders, free_names);
         } stack.count -= 1;
         binders->count -= 1;
     } break;
     case EXPR_APP:
         printf("[APP]\n");
         da_append(&stack, true); {
-            dump_expr_ast_scope(expr_slot(expr).as.app.lhs, binders);
+            dump_expr_ast_scope(expr_slot(expr).as.app.lhs, binders, free_names);
         } stack.count -= 1;
         da_append(&stack, false); {
-            dump_expr_ast_scope(expr_slot(expr).as.app.rhs, binders);
+            dump_expr_ast_scope(expr_slot(expr).as.app.rhs, binders, free_names);
         } stack.count -= 1;
         break;
     case EXPR_MAG:
@@ -618,8 +673,10 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
 void dump_expr_ast(Expr_Index expr)
 {
     static Binder_Stack binders = {0};
+    static Free_Name_Stack free_names = {0};
     binders.count = 0;
-    dump_expr_ast_scope(expr, &binders);
+    free_names.count = 0;
+    dump_expr_ast_scope(expr, &binders, &free_names);
 }
 
 void trace_expr(Expr_Index expr)
@@ -1706,22 +1763,27 @@ again:
 
                 goto again;
             }
-            if (command(&commands, l.string.items, "debruijn", "[on|off]", "Toggle printing of variables as de Bruijn indices.")) {
+            if (command(&commands, l.string.items, "debruijn", "[on|off|full]", "Set variable output: names, indices, or fully nameless De Bruijn indices.")) {
                 if (!lexer_next(&l)) goto again;
                 if (l.token == TOKEN_END) {
-                    output_debruijn_indices = !output_debruijn_indices;
+                    debruijn_mode = debruijn_mode == DEBRUIJN_OFF
+                        ? DEBRUIJN_ON
+                        : DEBRUIJN_OFF;
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "on") == 0) {
-                    output_debruijn_indices = true;
+                    debruijn_mode = DEBRUIJN_ON;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "off") == 0) {
-                    output_debruijn_indices = false;
+                    debruijn_mode = DEBRUIJN_OFF;
+                    if (!lexer_expect(&l, TOKEN_END)) goto again;
+                } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "full") == 0) {
+                    debruijn_mode = DEBRUIJN_FULL;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else {
                     lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Expected `on`, `off`, or no argument after :debruijn\n");
+                    fprintf(stderr, "ERROR: Expected `on`, `off`, `full`, or no argument after :debruijn\n");
                     goto again;
                 }
-                printf("De Bruijn indices output: %s\n", output_debruijn_indices ? "ON" : "OFF");
+                printf("De Bruijn indices output: %s\n", debruijn_mode_name(debruijn_mode));
                 goto again;
             }
             if (command(&commands, l.string.items, "ast", "<expr>", "print the AST of the expression")) {
