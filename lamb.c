@@ -7,9 +7,11 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <string.h>
-#include <ctype.h>
 #include <errno.h>
+#include <locale.h>
 #include <signal.h>
+#include <stdint.h>
+#include <wctype.h>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -284,35 +286,15 @@ const char *intern_label(const char *label)
     return result;
 }
 
-typedef struct {
-    // Displayed name of the symbol.
-    const char *label;
-    // Internal tag that makes two symbols with the same label different if needed.
-    // Usually used to obtain a fresh symbol for capture avoiding substitution.
-    size_t tag;
-} Symbol;
-
-bool symbol_eq(Symbol a, Symbol b)
-{
-    // NOTE: We compare addresses of the labels because they are expected to be interned with intern_label()
-    return a.label == b.label && a.tag == b.tag;
-}
-
-Symbol symbol(const char *label)
-{
-    Symbol s = { .label = intern_label(label), .tag = 0 };
-    return s;
-}
-
-Symbol symbol_fresh(Symbol s)
-{
-    static size_t global_counter = 0;
-    s.tag = ++global_counter;
-    return s;
-}
-
 typedef enum {
-    EXPR_VAR,
+    // Free variable that still has a printed name.
+    EXPR_FREE_NAME,
+    // Free de Bruijn index. It is relative to the outermost context, so it is
+    // not affected by the binders of the term it appears in.
+    EXPR_FREE_INDEX,
+    // Variable bound by one of the enclosing lambdas. The index counts the
+    // binders between the occurrence and its binder.
+    EXPR_BOUND,
     EXPR_FUN,
     EXPR_APP,
     EXPR_MAG,
@@ -327,10 +309,13 @@ typedef struct {
     bool visited;
     bool live;
     union {
-        Symbol var;
+        const char *free_name;
+        size_t free_index;
+        size_t bound;
         const char *mag;
         struct {
-            Symbol param;
+            // NULL means an anonymous binder written as `\.`
+            const char *param;
             Expr_Index body;
         } fun;
         struct {
@@ -393,11 +378,27 @@ void free_expr(Expr_Index expr)
     da_append(&GC.dead, expr);
 }
 
-Expr_Index var(Symbol name)
+Expr_Index free_var(const char *label)
 {
     Expr_Index expr = alloc_expr();
-    expr_slot(expr).kind = EXPR_VAR;
-    expr_slot(expr).as.var = name;
+    expr_slot(expr).kind = EXPR_FREE_NAME;
+    expr_slot(expr).as.free_name = intern_label(label);
+    return expr;
+}
+
+Expr_Index free_index(size_t index)
+{
+    Expr_Index expr = alloc_expr();
+    expr_slot(expr).kind = EXPR_FREE_INDEX;
+    expr_slot(expr).as.free_index = index;
+    return expr;
+}
+
+Expr_Index bound_var(size_t index)
+{
+    Expr_Index expr = alloc_expr();
+    expr_slot(expr).kind = EXPR_BOUND;
+    expr_slot(expr).as.bound = index;
     return expr;
 }
 
@@ -409,7 +410,7 @@ Expr_Index magic(const char *label)
     return expr;
 }
 
-Expr_Index fun(Symbol param, Expr_Index body)
+Expr_Index fun(const char *param, Expr_Index body)
 {
     Expr_Index expr = alloc_expr();
     expr_slot(expr).kind = EXPR_FUN;
@@ -427,50 +428,128 @@ Expr_Index app(Expr_Index lhs, Expr_Index rhs)
     return expr;
 }
 
-void expr_display(Expr_Index expr, String_Builder *sb)
+typedef struct {
+    const char **items;
+    size_t count;
+    size_t capacity;
+} Binder_Stack;
+
+// Toggled by the `:debruijn` command. When true every bound variable is
+// printed as an index instead of the name of its binder.
+static bool output_debruijn_indices = false;
+
+bool has_free_name(Expr_Index expr, const char *label)
 {
     switch (expr_slot(expr).kind) {
-    case EXPR_VAR:
-        sb_appendf(sb, "%s", expr_slot(expr).as.var.label);
-        if (expr_slot(expr).as.var.tag) {
-            sb_appendf(sb, ":%zu", expr_slot(expr).as.var.tag);
-        }
-        break;
+    case EXPR_FREE_NAME:
+        return expr_slot(expr).as.free_name == label;
+    case EXPR_FREE_INDEX:
+    case EXPR_BOUND:
+    case EXPR_MAG:
+        return false;
     case EXPR_FUN:
-        sb_appendf(sb, "\\");
-        while (expr_slot(expr).kind == EXPR_FUN) {
-            if (expr_slot(expr).as.fun.param.tag) {
-                sb_appendf(sb, "%s:%zu.", expr_slot(expr).as.fun.param.label, expr_slot(expr).as.fun.param.tag);
-            } else {
-                sb_appendf(sb, "%s.", expr_slot(expr).as.fun.param.label);
-            }
-            expr = expr_slot(expr).as.fun.body;
-        }
-        expr_display(expr, sb);
+        return has_free_name(expr_slot(expr).as.fun.body, label);
+    case EXPR_APP:
+        return has_free_name(expr_slot(expr).as.app.lhs, label) ||
+               has_free_name(expr_slot(expr).as.app.rhs, label);
+    default: UNREACHABLE("Expr_Kind");
+    }
+}
+
+// Picks the name under which a binder is printed. If a free variable with the
+// same name occurs in the body, printing the original name would capture it,
+// so a fresh name is derived from it.
+const char *display_binder_name(const char *param, Expr_Index body)
+{
+    if (param == NULL) return NULL;
+    if (!has_free_name(body, param)) return param;
+
+    static String_Builder sb = {0};
+    for (size_t i = 1;; ++i) {
+        sb.count = 0;
+        sb_appendf(&sb, "%s_%zu", param, i);
+        sb_append_null(&sb);
+        const char *candidate = intern_label(sb.items);
+        if (!has_free_name(body, candidate)) return candidate;
+    }
+}
+
+// Whether the binder at `index` is hidden by a closer binder with the same
+// display name. Such variables are printed as indices to avoid ambiguity.
+bool bound_name_is_shadowed(Binder_Stack *stack, size_t index)
+{
+    assert(index < stack->count);
+    const char *label = stack->items[stack->count - 1 - index];
+    if (label == NULL) return true;
+    for (size_t i = stack->count - index; i < stack->count; ++i) {
+        if (stack->items[i] == label) return true;
+    }
+    return false;
+}
+
+void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack)
+{
+    switch (expr_slot(expr).kind) {
+    case EXPR_FREE_NAME:
+        sb_appendf(sb, "%s", expr_slot(expr).as.free_name);
         break;
+    case EXPR_FREE_INDEX:
+        sb_appendf(sb, "%zu", stack->count + expr_slot(expr).as.free_index);
+        break;
+    case EXPR_BOUND: {
+        size_t index = expr_slot(expr).as.bound;
+        if (!output_debruijn_indices && !bound_name_is_shadowed(stack, index)) {
+            sb_appendf(sb, "%s", stack->items[stack->count - 1 - index]);
+        } else {
+            sb_appendf(sb, "%zu", index);
+        }
+    } break;
+    case EXPR_FUN: {
+        const char *param = expr_slot(expr).as.fun.param;
+        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
+        sb_appendf(sb, "\\");
+        if (name) {
+            sb_appendf(sb, "%s.", name);
+        } else {
+            sb_appendf(sb, ".");
+        }
+        da_append(stack, name);
+        expr_display_scope(expr_slot(expr).as.fun.body, sb, stack);
+        stack->count -= 1;
+    } break;
     case EXPR_APP: {
         Expr_Index lhs = expr_slot(expr).as.app.lhs;
         bool lhs_paren = expr_slot(lhs).kind == EXPR_FUN;
         if (lhs_paren) sb_appendf(sb, "(");
-        expr_display(lhs, sb);
+        expr_display_scope(lhs, sb, stack);
         if (lhs_paren) sb_appendf(sb, ")");
 
         sb_appendf(sb, " ");
 
         Expr_Index rhs = expr_slot(expr).as.app.rhs;
-        bool rhs_paren = expr_slot(rhs).kind != EXPR_VAR && expr_slot(rhs).kind != EXPR_MAG;
+        bool rhs_paren = expr_slot(rhs).kind != EXPR_BOUND &&
+                         expr_slot(rhs).kind != EXPR_FREE_NAME &&
+                         expr_slot(rhs).kind != EXPR_FREE_INDEX &&
+                         expr_slot(rhs).kind != EXPR_MAG;
         if (rhs_paren) sb_appendf(sb, "(");
-        expr_display(rhs, sb);
+        expr_display_scope(rhs, sb, stack);
         if (rhs_paren) sb_appendf(sb, ")");
     } break;
-    case EXPR_MAG: {
+    case EXPR_MAG:
         sb_appendf(sb, "#%s", expr_slot(expr).as.mag);
-    } break;
+        break;
     default: UNREACHABLE("Expr_Kind");
     }
 }
 
-void dump_expr_ast(Expr_Index expr)
+void expr_display(Expr_Index expr, String_Builder *sb)
+{
+    static Binder_Stack stack = {0};
+    stack.count = 0;
+    expr_display_scope(expr, sb, &stack);
+}
+
+void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
 {
     static struct {
         bool *items;
@@ -491,38 +570,56 @@ void dump_expr_ast(Expr_Index expr)
     }
 
     switch (expr_slot(expr).kind) {
-    case EXPR_VAR:
-        if (expr_slot(expr).as.var.tag == 0) {
-            printf("[VAR] %s\n", expr_slot(expr).as.var.label);
-        } else {
-            printf("[VAR] %s:%zu\n", expr_slot(expr).as.var.label, expr_slot(expr).as.var.tag);
-        }
+    case EXPR_FREE_NAME:
+        printf("[VAR] %s\n", expr_slot(expr).as.free_name);
         break;
-    case EXPR_FUN:
-        if (expr_slot(expr).as.fun.param.tag == 0) {
-            printf("[FUN] \\%s\n", expr_slot(expr).as.fun.param.label);
+    case EXPR_FREE_INDEX:
+        printf("[VAR] %zu\n", binders->count + expr_slot(expr).as.free_index);
+        break;
+    case EXPR_BOUND: {
+        size_t index = expr_slot(expr).as.bound;
+        if (!output_debruijn_indices && !bound_name_is_shadowed(binders, index)) {
+            printf("[VAR] %s\n", binders->items[binders->count - 1 - index]);
         } else {
-            printf("[FUN] \\%s:%zu\n", expr_slot(expr).as.fun.param.label, expr_slot(expr).as.fun.param.tag);
+            printf("[VAR] %zu\n", index);
         }
+    } break;
+    case EXPR_FUN: {
+        const char *param = expr_slot(expr).as.fun.param;
+        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
+        if (name) {
+            printf("[FUN] \\%s\n", name);
+        } else {
+            printf("[FUN] \\.\n");
+        }
+        da_append(binders, name);
         da_append(&stack, false); {
-            dump_expr_ast(expr_slot(expr).as.fun.body);
+            dump_expr_ast_scope(expr_slot(expr).as.fun.body, binders);
         } stack.count -= 1;
-        break;
+        binders->count -= 1;
+    } break;
     case EXPR_APP:
         printf("[APP]\n");
         da_append(&stack, true); {
-            dump_expr_ast(expr_slot(expr).as.app.lhs);
+            dump_expr_ast_scope(expr_slot(expr).as.app.lhs, binders);
         } stack.count -= 1;
         da_append(&stack, false); {
-            dump_expr_ast(expr_slot(expr).as.app.rhs);
+            dump_expr_ast_scope(expr_slot(expr).as.app.rhs, binders);
         } stack.count -= 1;
         break;
     case EXPR_MAG:
         printf("[MAG] #%s\n", expr_slot(expr).as.mag);
         break;
     default:
-        UNREACHABLE("Expr_Index");
+        UNREACHABLE("Expr_Kind");
     }
+}
+
+void dump_expr_ast(Expr_Index expr)
+{
+    static Binder_Stack binders = {0};
+    binders.count = 0;
+    dump_expr_ast_scope(expr, &binders);
 }
 
 void trace_expr(Expr_Index expr)
@@ -534,54 +631,91 @@ void trace_expr(Expr_Index expr)
     printf("%s", sb.items);
 }
 
-bool is_var_free_there(Symbol name, Expr_Index there)
+// Shifts bound variables of `expr` by `delta`. Variables under `cutoff` or
+// more binders are considered local to the term and are left alone.
+Expr_Index expr_shift(Expr_Index expr, size_t delta, size_t cutoff)
 {
-    switch (expr_slot(there).kind) {
-    case EXPR_VAR:
-        return symbol_eq(expr_slot(there).as.var, name);
-    case EXPR_FUN:
-        if (symbol_eq(expr_slot(there).as.fun.param, name)) return false;
-        return is_var_free_there(name, expr_slot(there).as.fun.body);
-    case EXPR_APP:
-        if (is_var_free_there(name, expr_slot(there).as.app.lhs)) return true;
-        if (is_var_free_there(name, expr_slot(there).as.app.rhs)) return true;
-        return false;
+    if (delta == 0) return expr;
+    switch (expr_slot(expr).kind) {
+    case EXPR_FREE_NAME:
+    case EXPR_FREE_INDEX:
     case EXPR_MAG:
-        return false;
+        return expr;
+    case EXPR_BOUND: {
+        size_t index = expr_slot(expr).as.bound;
+        if (index >= cutoff) return bound_var(index + delta);
+        return expr;
+    }
+    case EXPR_FUN: {
+        const char *param = expr_slot(expr).as.fun.param;
+        return fun(param, expr_shift(expr_slot(expr).as.fun.body, delta, cutoff + 1));
+    }
+    case EXPR_APP: {
+        Expr_Index lhs = expr_slot(expr).as.app.lhs;
+        Expr_Index rhs = expr_slot(expr).as.app.rhs;
+        return app(expr_shift(lhs, delta, cutoff), expr_shift(rhs, delta, cutoff));
+    }
     default: UNREACHABLE("Expr_Kind");
     }
 }
 
-Expr_Index replace(Symbol param, Expr_Index body, Expr_Index arg)
+// Replaces the variable bound by the lambda being reduced in `body` with
+// `arg`. `depth` counts the binders crossed inside `body` on the way to the
+// replaced variable.
+Expr_Index beta_subst(Expr_Index body, Expr_Index arg, size_t depth)
 {
     switch (expr_slot(body).kind) {
+    case EXPR_FREE_NAME:
+    case EXPR_FREE_INDEX:
     case EXPR_MAG:
         return body;
-    case EXPR_VAR:
-        if (symbol_eq(expr_slot(body).as.var, param)) {
-            return arg;
-        } else {
-            return body;
-        }
-    case EXPR_FUN:
-        if (symbol_eq(expr_slot(body).as.fun.param, param)) return body;
-        if (!is_var_free_there(expr_slot(body).as.fun.param, arg)) {
-            return fun(expr_slot(body).as.fun.param, replace(param, expr_slot(body).as.fun.body, arg));
-        }
-        Symbol fresh_param_name = symbol_fresh(expr_slot(body).as.fun.param);
-        Expr_Index fresh_param = var(fresh_param_name);
-        return fun(
-            fresh_param_name,
-            replace(param,
-                replace(
-                    expr_slot(body).as.fun.param,
-                    expr_slot(body).as.fun.body,
-                    fresh_param),
-                arg));
-    case EXPR_APP:
+    case EXPR_BOUND: {
+        size_t index = expr_slot(body).as.bound;
+        if (index == depth) return expr_shift(arg, depth, 0);
+        if (index > depth) return bound_var(index - 1);
+        return body;
+    }
+    case EXPR_FUN: {
+        const char *param = expr_slot(body).as.fun.param;
+        return fun(param, beta_subst(expr_slot(body).as.fun.body, arg, depth + 1));
+    }
+    case EXPR_APP: {
+        Expr_Index lhs = expr_slot(body).as.app.lhs;
+        Expr_Index rhs = expr_slot(body).as.app.rhs;
         return app(
-            replace(param, expr_slot(body).as.app.lhs, arg),
-            replace(param, expr_slot(body).as.app.rhs, arg));
+            beta_subst(lhs, arg, depth),
+            beta_subst(rhs, arg, depth));
+    }
+    default: UNREACHABLE("Expr_Kind");
+    }
+}
+
+// Replaces free variables named `name` with `replacement`. `depth` is the
+// number of binders crossed, which is how much the free bound variables of
+// the replacement need to be shifted.
+Expr_Index subst_free_name(Expr_Index expr, const char *name, Expr_Index replacement, size_t depth)
+{
+    switch (expr_slot(expr).kind) {
+    case EXPR_FREE_NAME:
+        if (expr_slot(expr).as.free_name == name) {
+            return expr_shift(replacement, depth, 0);
+        }
+        return expr;
+    case EXPR_FREE_INDEX:
+    case EXPR_BOUND:
+    case EXPR_MAG:
+        return expr;
+    case EXPR_FUN: {
+        const char *param = expr_slot(expr).as.fun.param;
+        return fun(param, subst_free_name(expr_slot(expr).as.fun.body, name, replacement, depth + 1));
+    }
+    case EXPR_APP: {
+        Expr_Index lhs = expr_slot(expr).as.app.lhs;
+        Expr_Index rhs = expr_slot(expr).as.app.rhs;
+        return app(
+            subst_free_name(lhs, name, replacement, depth),
+            subst_free_name(rhs, name, replacement, depth));
+    }
     default: UNREACHABLE("Expr_Kind");
     }
 }
@@ -589,7 +723,10 @@ Expr_Index replace(Symbol param, Expr_Index body, Expr_Index arg)
 bool eval1(Expr_Index expr, Expr_Index *expr1)
 {
     switch (expr_slot(expr).kind) {
-    case EXPR_VAR:
+    case EXPR_FREE_NAME:
+    case EXPR_FREE_INDEX:
+    case EXPR_BOUND:
+    case EXPR_MAG:
         *expr1 = expr;
         return true;
     case EXPR_FUN: {
@@ -607,10 +744,7 @@ bool eval1(Expr_Index expr, Expr_Index *expr1)
         Expr_Index rhs = expr_slot(expr).as.app.rhs;
 
         if (expr_slot(lhs).kind == EXPR_FUN) {
-            *expr1 = replace(
-                expr_slot(lhs).as.fun.param,
-                expr_slot(lhs).as.fun.body,
-                rhs);
+            *expr1 = beta_subst(expr_slot(lhs).as.fun.body, rhs, 0);
             return true;
         } else if (expr_slot(lhs).kind == EXPR_MAG) {
             if (expr_slot(lhs).as.mag == intern_label("trace")) {
@@ -657,9 +791,6 @@ bool eval1(Expr_Index expr, Expr_Index *expr1)
         *expr1 = expr;
         return true;
     }
-    case EXPR_MAG:
-        *expr1 = expr;
-        return true;
     default: UNREACHABLE("Expr_Kind");
     }
 }
@@ -675,6 +806,7 @@ typedef enum {
     TOKEN_SEMICOLON,
     TOKEN_EQUALS,
     TOKEN_NAME,
+    TOKEN_INDEX,
     TOKEN_MAGIC,
 } Token_Kind;
 
@@ -691,6 +823,7 @@ const char *token_kind_display(Token_Kind kind)
     case TOKEN_SEMICOLON: return "TOKEN_SEMICOLON";
     case TOKEN_EQUALS:    return "TOKEN_EQUALS";
     case TOKEN_NAME:      return "TOKEN_NAME";
+    case TOKEN_INDEX:     return "TOKEN_INDEX";
     case TOKEN_MAGIC:     return "TOKEN_MAGIC";
     default: UNREACHABLE("Token_Kind");
     }
@@ -709,6 +842,7 @@ typedef struct {
 
     Token_Kind token;
     String_Builder string;
+    size_t index;
     size_t row, col;
 } Lexer;
 
@@ -743,9 +877,132 @@ char lexer_next_char(Lexer *l)
     return x;
 }
 
+bool is_ascii_space(int x)
+{
+    return x == ' ' || x == '\t' || x == '\n' || x == '\r' || x == '\v' || x == '\f';
+}
+
+// Decodes one UTF-8 code point from `s`. Returns the number of bytes consumed,
+// or 0 for an invalid or incomplete sequence. Rejects overlong forms, UTF-16
+// surrogates, and code points above U+10FFFF.
+size_t decode_utf8(const char *s, size_t n, uint32_t *cp)
+{
+    const unsigned char *bytes = (const unsigned char *) s;
+    if (n == 0) return 0;
+
+    unsigned char b0 = bytes[0];
+    if (b0 < 0x80) {
+        *cp = b0;
+        return 1;
+    }
+
+    size_t len;
+    uint32_t value;
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        len = 2;
+        value = b0 & 0x1F;
+    } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        len = 3;
+        value = b0 & 0x0F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        len = 4;
+        value = b0 & 0x07;
+    } else {
+        return 0;
+    }
+
+    if (n < len) return 0;
+    for (size_t i = 1; i < len; ++i) {
+        if ((bytes[i] & 0xC0) != 0x80) return 0;
+        value = (value << 6) | (bytes[i] & 0x3F);
+    }
+
+    if ((len == 3 && value < 0x800) ||
+        (len == 4 && value < 0x10000) ||
+        (value >= 0xD800 && value <= 0xDFFF) ||
+        value > 0x10FFFF) {
+        return 0;
+    }
+
+    *cp = value;
+    return len;
+}
+
+// Counts characters in a byte slice, treating every invalid byte as one
+// character. Used to report columns in characters rather than bytes.
+size_t count_chars(const char *s, size_t n)
+{
+    size_t count = 0;
+    size_t i = 0;
+    while (i < n) {
+        uint32_t cp = 0;
+        size_t len = decode_utf8(s + i, n - i, &cp);
+        i += len > 0 ? len : 1;
+        ++count;
+    }
+    return count;
+}
+
+// Selects a locale for iswalnum(), which classifies non-ASCII name
+// characters. The lexer decodes UTF-8 itself; the locale is only used for
+// classification. Prefer a UTF-8 locale and fall back to the system one.
+void init_name_locale(void)
+{
+    static const char *const candidates[] = {
+        "C.UTF-8", ".UTF-8", "en_US.UTF-8", "UTF-8", ".utf8",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (setlocale(LC_CTYPE, candidates[i])) return;
+    }
+    setlocale(LC_CTYPE, "");
+}
+
+bool is_ascii_alnum(uint32_t cp)
+{
+    return (cp >= '0' && cp <= '9') ||
+           (cp >= 'a' && cp <= 'z') ||
+           (cp >= 'A' && cp <= 'Z');
+}
+
+// Whether `cp` is a digit. Digits cannot start a name: they are de Bruijn
+// indices instead.
+bool is_digit_cp(uint32_t cp)
+{
+    if (cp >= '0' && cp <= '9') return true;
+    if (cp < 0x80) return false;
+    if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
+    return iswdigit((wint_t) cp) != 0;
+}
+
+// Whether `cp` may appear in a name. ASCII letters and digits are always
+// accepted; non-ASCII letters and digits are accepted when the C library's
+// locale knows them (see init_name_locale()). `_`, `?`, `-`, and `'` are
+// always accepted, while `λ` is reserved for the lambda operator.
+bool is_name_cp(uint32_t cp)
+{
+    if (cp == 0x03BB) return false;
+    if (cp < 0x80) {
+        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'';
+    }
+    if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
+    return iswalnum((wint_t) cp) != 0;
+}
+
+void lexer_read_name_chars(Lexer *l)
+{
+    for (;;) {
+        uint32_t cp = 0;
+        size_t len = decode_utf8(l->content + l->cur.pos, l->count - l->cur.pos, &cp);
+        if (len == 0 || !is_name_cp(cp)) break;
+        for (size_t i = 0; i < len; ++i) {
+            da_append(&l->string, lexer_next_char(l));
+        }
+    }
+}
+
 void lexer_trim_left(Lexer *l)
 {
-    while (isspace(lexer_curr_char(l))) {
+    while (is_ascii_space(lexer_curr_char(l))) {
         lexer_next_char(l);
     }
 }
@@ -765,11 +1022,6 @@ void lexer_drop_line(Lexer *l)
     while (l->cur.pos < l->count && lexer_next_char(l) != '\n') {}
 }
 
-bool issymbol(int x)
-{
-    return isalnum(x) || x == '_';
-}
-
 bool lexer_next(Lexer *l)
 {
     for (;;) {
@@ -779,50 +1031,117 @@ bool lexer_next(Lexer *l)
     }
 
     l->row = l->cur.row + 1;
-    l->col = l->cur.pos - l->cur.bol + 1;
+    l->col = 1 + count_chars(l->content + l->cur.bol, l->cur.pos - l->cur.bol);
 
-    char x = lexer_next_char(l);
-    if (x == '\0') {
+    if (l->cur.pos >= l->count) {
         l->token = TOKEN_END;
         return true;
     }
 
-    switch (x) {
-    case '(':  l->token = TOKEN_OPAREN;    return true;
-    case ')':  l->token = TOKEN_CPAREN;    return true;
-    case '\\': l->token = TOKEN_LAMBDA;    return true;
-    case '.':  l->token = TOKEN_DOT;       return true;
-    case ':':  l->token = TOKEN_COLON;     return true;
-    case ';':  l->token = TOKEN_SEMICOLON; return true;
-    case '=':  l->token = TOKEN_EQUALS;    return true;
+    size_t start = l->cur.pos;
+    uint32_t cp = 0;
+    size_t len = decode_utf8(l->content + start, l->count - start, &cp);
+    if (len == 0) {
+        // Invalid UTF-8 is reported one byte at a time.
+        char x = lexer_next_char(l);
+        l->token = TOKEN_INVALID;
+        lexer_print_loc(l, stderr);
+        fprintf(stderr, "ERROR: Unknown token starts with `%c`\n", x);
+        return false;
     }
 
-    if (x == '#') {
-        l->token = TOKEN_MAGIC;
-        l->string.count = 0;
-        while (issymbol(lexer_curr_char(l))) {
-            x = lexer_next_char(l);
-            da_append(&l->string, x);
-        }
-        sb_append_null(&l->string);
+    // A NUL byte is treated as the end of input.
+    if (cp == 0) {
+        for (size_t i = 0; i < len; ++i) lexer_next_char(l);
+        l->token = TOKEN_END;
         return true;
     }
 
-    if (issymbol(x)) {
+    // U+03BB GREEK SMALL LETTER LAMDA as an alternative spelling of `\`.
+    if (cp == 0x03BB) {
+        for (size_t i = 0; i < len; ++i) lexer_next_char(l);
+        l->token = TOKEN_LAMBDA;
+        return true;
+    }
+
+    if (cp < 0x80) {
+        switch ((char) cp) {
+        case '(':  lexer_next_char(l); l->token = TOKEN_OPAREN;    return true;
+        case ')':  lexer_next_char(l); l->token = TOKEN_CPAREN;    return true;
+        case '\\': lexer_next_char(l); l->token = TOKEN_LAMBDA;    return true;
+        case '.':  lexer_next_char(l); l->token = TOKEN_DOT;       return true;
+        case ':':  lexer_next_char(l); l->token = TOKEN_COLON;     return true;
+        case ';':  lexer_next_char(l); l->token = TOKEN_SEMICOLON; return true;
+        case '=':  lexer_next_char(l); l->token = TOKEN_EQUALS;     return true;
+        case '#':
+            lexer_next_char(l);
+            l->token = TOKEN_MAGIC;
+            l->string.count = 0;
+            lexer_read_name_chars(l);
+            sb_append_null(&l->string);
+            return true;
+        }
+    }
+
+    // A run of ASCII digits is a de Bruijn index. Names cannot start with a
+    // digit, so `1abc` is rejected instead of being split into two tokens.
+    if (cp >= '0' && cp <= '9') {
+        size_t index = 0;
+        bool overflow = false;
+        while (lexer_curr_char(l) >= '0' && lexer_curr_char(l) <= '9') {
+            size_t digit = (size_t)(lexer_curr_char(l) - '0');
+            if (index > (SIZE_MAX - digit) / 10) {
+                overflow = true;
+            } else {
+                index = index * 10 + digit;
+            }
+            lexer_next_char(l);
+        }
+
+        uint32_t next_cp = 0;
+        size_t next_len = decode_utf8(l->content + l->cur.pos, l->count - l->cur.pos, &next_cp);
+        if (next_len > 0 && is_name_cp(next_cp)) {
+            l->token = TOKEN_INVALID;
+            lexer_print_loc(l, stderr);
+            fprintf(stderr, "ERROR: A name cannot start with a digit\n");
+            return false;
+        }
+
+        if (overflow) {
+            l->token = TOKEN_INVALID;
+            lexer_print_loc(l, stderr);
+            fprintf(stderr, "ERROR: De Bruijn index is too large\n");
+            return false;
+        }
+
+        l->token = TOKEN_INDEX;
+        l->index = index;
+        return true;
+    }
+
+    if (is_name_cp(cp) && !is_digit_cp(cp)) {
         l->token = TOKEN_NAME;
         l->string.count = 0;
-        da_append(&l->string, x);
-        while (issymbol(lexer_curr_char(l))) {
-            x = lexer_next_char(l);
-            da_append(&l->string, x);
+        for (size_t i = 0; i < len; ++i) {
+            da_append(&l->string, lexer_next_char(l));
         }
+        lexer_read_name_chars(l);
         sb_append_null(&l->string);
         return true;
     }
 
+    if (is_name_cp(cp) && is_digit_cp(cp)) {
+        for (size_t i = 0; i < len; ++i) lexer_next_char(l);
+        l->token = TOKEN_INVALID;
+        lexer_print_loc(l, stderr);
+        fprintf(stderr, "ERROR: A name cannot start with a digit `%.*s`\n", (int) len, l->content + start);
+        return false;
+    }
+
+    for (size_t i = 0; i < len; ++i) lexer_next_char(l);
     l->token = TOKEN_INVALID;
     lexer_print_loc(l, stderr);
-    fprintf(stderr, "ERROR: Unknown token starts with `%c`\n", x);
+    fprintf(stderr, "ERROR: Unknown token starts with `%.*s`\n", (int) len, l->content + start);
     return false;
 }
 
@@ -850,48 +1169,82 @@ bool lexer_expect(Lexer *l, Token_Kind expected)
     return true;
 }
 
-bool parse_expr(Lexer *l, Expr_Index *expr);
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr);
 
-bool parse_fun(Lexer *l, Expr_Index *expr)
+bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
-    if (!lexer_expect(l, TOKEN_NAME)) return false;
-    Symbol arg = symbol(l->string.items);
-    if (!lexer_expect(l, TOKEN_DOT)) return false;
-
-    Token_Kind a, b;
-    Cur cur = l->cur; {
-        if (!lexer_next(l)) return false;
-        a = l->token;
-        if (!lexer_next(l)) return false;
-        b = l->token;
-    } l->cur = cur;
-
-    Expr_Index body;
-    if (a == TOKEN_NAME && b == TOKEN_DOT) {
-        if (!parse_fun(l, &body)) return false;
+    const char *param = NULL;
+    if (!lexer_next(l)) return false;
+    if (l->token == TOKEN_DOT) {
+        // `\.body` is an anonymous binder that can only be referred to with
+        // de Bruijn indices.
+    } else if (l->token == TOKEN_NAME) {
+        param = intern_label(l->string.items);
+        if (!lexer_expect(l, TOKEN_DOT)) return false;
     } else {
-        if (!parse_expr(l, &body)) return false;
+        lexer_print_loc(l, stderr);
+        fprintf(stderr, "ERROR: Unexpected token %s. Expected a parameter name or `.` instead.\n",
+                token_kind_display(l->token));
+        return false;
     }
-    *expr = fun(arg, body);
+
+    // NOTE: `\x.y.body` means `\x.\y.body`
+    bool shorthand = false;
+    {
+        Cur cur = l->cur;
+        if (!lexer_next(l)) return false;
+        if (l->token == TOKEN_NAME) {
+            if (!lexer_next(l)) return false;
+            shorthand = l->token == TOKEN_DOT;
+        }
+        l->cur = cur;
+    }
+
+    da_append(scope, param);
+    Expr_Index body;
+    bool ok = shorthand
+        ? parse_fun_scope(l, scope, &body)
+        : parse_expr_scope(l, scope, &body);
+    scope->count -= 1;
+    if (!ok) return false;
+
+    *expr = fun(param, body);
     return true;
 }
 
-bool parse_primary(Lexer *l, Expr_Index *expr)
+bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
-    if (!lexer_next(l)) return NULL;
-    switch ((int)l->token) {
+    if (!lexer_next(l)) return false;
+    switch (l->token) {
     case TOKEN_OPAREN: {
-        if (!parse_expr(l, expr)) return false;
+        if (!parse_expr_scope(l, scope, expr)) return false;
         if (!lexer_expect(l, TOKEN_CPAREN)) return false;
         return true;
     }
-    case TOKEN_LAMBDA: return parse_fun(l, expr);
+    case TOKEN_LAMBDA: return parse_fun_scope(l, scope, expr);
     case TOKEN_MAGIC:
         *expr = magic(l->string.items);
         return true;
-    case TOKEN_NAME:
-        *expr = var(symbol(l->string.items));
+    case TOKEN_INDEX: {
+        size_t index = l->index;
+        if (index < scope->count) {
+            *expr = bound_var(index);
+        } else {
+            *expr = free_index(index - scope->count);
+        }
         return true;
+    }
+    case TOKEN_NAME: {
+        const char *label = intern_label(l->string.items);
+        for (size_t i = scope->count; i > 0; --i) {
+            if (scope->items[i - 1] == label) {
+                *expr = bound_var(scope->count - i);
+                return true;
+            }
+        }
+        *expr = free_var(label);
+        return true;
+    }
     default:
         lexer_print_loc(l, stderr);
         fprintf(stderr, "ERROR: Unexpected token %s. Expected a primary expression instead.\n", token_kind_display(l->token));
@@ -899,9 +1252,9 @@ bool parse_primary(Lexer *l, Expr_Index *expr)
     }
 }
 
-bool parse_expr(Lexer *l, Expr_Index *expr)
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
-    if (!parse_primary(l, expr)) return false;
+    if (!parse_primary_scope(l, scope, expr)) return false;
 
     if (!lexer_peek(l)) return false;
     while (
@@ -910,41 +1263,45 @@ bool parse_expr(Lexer *l, Expr_Index *expr)
         l->token != TOKEN_SEMICOLON
     ) {
         Expr_Index rhs;
-        if (!parse_primary(l, &rhs)) return false;
+        if (!parse_primary_scope(l, scope, &rhs)) return false;
         *expr = app(*expr, rhs);
         if (!lexer_peek(l)) return false;
     }
     return true;
 }
 
+bool parse_expr(Lexer *l, Expr_Index *expr)
+{
+    static Binder_Stack scope = {0};
+    scope.count = 0;
+    return parse_expr_scope(l, &scope, expr);
+}
+
 bool parse_binding_body(Lexer *l, Expr_Index *body)
 {
     // NOTE: the parameters of a binding are just syntactic sugar for nested lambdas.
     // `f x y = body;` is equivalent to `f = \x.y.body;`
-    struct { Symbol *items; size_t count; size_t capacity; } params = {0};
+    static Binder_Stack scope = {0};
+    scope.count = 0;
 
     for (;;) {
-        if (!lexer_next(l)) goto fail;
+        if (!lexer_next(l)) return false;
         if (l->token != TOKEN_NAME) break;
-        da_append(&params, symbol(l->string.items));
+        da_append(&scope, intern_label(l->string.items));
     }
 
     if (l->token != TOKEN_EQUALS) {
         report_unexpected(l, TOKEN_EQUALS);
-        goto fail;
+        return false;
     }
 
-    if (!parse_expr(l, body)) goto fail;
+    if (!parse_expr_scope(l, &scope, body)) return false;
 
-    for (size_t i = params.count; i > 0; --i) {
-        *body = fun(params.items[i - 1], *body);
+    for (size_t i = scope.count; i > 0; --i) {
+        *body = fun(scope.items[i - 1], *body);
     }
-
-    free(params.items);
+    scope.count = 0;
     return true;
-fail:
-    free(params.items);
-    return false;
 }
 
 typedef struct {
@@ -1001,7 +1358,9 @@ void gc_mark(Expr_Index root)
     expr_slot(root).visited = true;
     switch (expr_slot(root).kind) {
     case EXPR_MAG:
-    case EXPR_VAR:
+    case EXPR_FREE_NAME:
+    case EXPR_FREE_INDEX:
+    case EXPR_BOUND:
         break;
     case EXPR_FUN:
         gc_mark(expr_slot(root).as.fun.body);
@@ -1015,7 +1374,7 @@ void gc_mark(Expr_Index root)
 }
 
 typedef struct {
-    Symbol name;
+    const char *name;
     Expr_Index body;
 } Binding;
 
@@ -1025,16 +1384,12 @@ typedef struct {
     size_t capacity;
 } Bindings;
 
-void create_binding(Bindings *bindings, Symbol name, Expr_Index body)
+void create_binding(Bindings *bindings, const char *name, Expr_Index body)
 {
     for (size_t i = 0; i < bindings->count; ++i) {
-        if (symbol_eq(bindings->items[i].name, name)) {
+        if (bindings->items[i].name == name) {
             bindings->items[i].body = body;
-            if (name.tag == 0) {
-                printf("Updated binding %s\n", name.label);
-            } else {
-                printf("Updated binding %s:%zu\n", name.label, name.tag);
-            }
+            printf("Updated binding %s\n", name);
             return;
         }
     }
@@ -1043,11 +1398,7 @@ void create_binding(Bindings *bindings, Symbol name, Expr_Index body)
         .body = body,
     };
     da_append(bindings, binding);
-    if (name.tag == 0) {
-        printf("Created binding %s\n", name.label);
-    } else {
-        printf("Created binding %s:%zu\n", name.label, name.tag);
-    }
+    printf("Created binding %s\n", name);
 }
 
 bool create_bindings_from_file(const char *file_path, Bindings *bindings)
@@ -1063,7 +1414,7 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
     if (!lexer_peek(&l)) return false;
     while (l.token != TOKEN_END) {
         if (!lexer_expect(&l, TOKEN_NAME)) return false;
-        Symbol name = symbol(l.string.items);
+        const char *name = intern_label(l.string.items);
         Expr_Index body;
         if (!parse_binding_body(&l, &body)) return false;
         if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
@@ -1109,11 +1460,11 @@ void replace_active_file_path_from_lexer_if_not_empty(Lexer l, char **active_fil
 {
     const char *path_data = &l.content[l.cur.pos];
     size_t path_count = l.count - l.cur.pos;
-    while (path_count > 0 && isspace(*path_data)) {
+    while (path_count > 0 && is_ascii_space((unsigned char) *path_data)) {
         path_data++;
         path_count--;
     }
-    while (path_count > 0 && isspace(path_data[path_count - 1])) {
+    while (path_count > 0 && is_ascii_space((unsigned char) path_data[path_count - 1])) {
         path_count--;
     }
 
@@ -1129,6 +1480,8 @@ int main(int argc, char **argv)
     static Commands commands = {0};
     static Bindings bindings = {0};
     static Lexer l = {0};
+
+    init_name_locale();
 
 #ifndef _WIN32
     // TODO(20251221-171559): Handle ctrl+c on Windows
@@ -1201,8 +1554,7 @@ again:
                 static String_Builder sb = {0};
                 sb.count = 0;
                 for (size_t i = 0; i < bindings.count; ++i) {
-                    assert(bindings.items[i].name.tag == 0);
-                    sb_appendf(&sb, "%s = ", bindings.items[i].name.label);
+                    sb_appendf(&sb, "%s = ", bindings.items[i].name);
                     expr_display(bindings.items[i].body, &sb);
                     sb_appendf(&sb, ";\n");
                 }
@@ -1266,9 +1618,8 @@ again:
 
                 if (args.count == 0) {
                     for (size_t i = 0; i < bindings.count; ++i) {
-                        assert(bindings.items[i].name.tag == 0);
                         sb.count = 0;
-                        sb_appendf(&sb, "%s = ", bindings.items[i].name.label);
+                        sb_appendf(&sb, "%s = ", bindings.items[i].name);
                         expr_display(bindings.items[i].body, &sb);
                         sb_appendf(&sb, ";");
                         sb_append_null(&sb);
@@ -1281,10 +1632,9 @@ again:
                     const char *label = args.items[j];
                     bool found = false;
                     for (size_t i = 0; !found && i < bindings.count; ++i) {
-                        assert(bindings.items[i].name.tag == 0);
-                        if (bindings.items[i].name.label == label) {
+                        if (bindings.items[i].name == label) {
                             sb.count = 0;
-                            sb_appendf(&sb, "%s = ", bindings.items[i].name.label);
+                            sb_appendf(&sb, "%s = ", bindings.items[i].name);
                             expr_display(bindings.items[i].body, &sb);
                             sb_appendf(&sb, ";");
                             sb_append_null(&sb);
@@ -1302,15 +1652,15 @@ again:
             }
             if (command(&commands, l.string.items, "delete", "<name>", "delete a binding by name")) {
                 if (!lexer_expect(&l, TOKEN_NAME)) goto again;
-                Symbol name = symbol(l.string.items);
+                const char *name = intern_label(l.string.items);
                 for (size_t i = 0; i < bindings.count; ++i) {
-                    if (symbol_eq(bindings.items[i].name, name)) {
+                    if (bindings.items[i].name == name) {
                         da_delete_at(&bindings, i);
-                        printf("Deleted binding %s\n", name.label);
+                        printf("Deleted binding %s\n", name);
                         goto again;
                     }
                 }
-                printf("ERROR: binding %s was not found\n", name.label);
+                printf("ERROR: binding %s was not found\n", name);
                 goto again;
             }
             if (command(&commands, l.string.items, "debug", "<expr>", "Step debug the evaluation of an expression")) {
@@ -1318,7 +1668,7 @@ again:
                 if (!parse_expr(&l, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 for (size_t i = bindings.count; i > 0; --i) {
-                    expr = replace(bindings.items[i-1].name, expr, bindings.items[i-1].body);
+                    expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);
                 }
 
                 ctrl_c = 0;
@@ -1330,7 +1680,6 @@ again:
                     printf("\n");
 
                     printf("-> ");
-                    fflush(stdin);
 
                     // TODO: get rid of the debug REPL. Just make it step through expressions by pressing Enter.
                     // Cancelling debug mode should be Ctrl+C which means we must sort it out on Windows.
@@ -1355,6 +1704,24 @@ again:
                     expr = expr1;
                 }
 
+                goto again;
+            }
+            if (command(&commands, l.string.items, "debruijn", "[on|off]", "Toggle printing of variables as de Bruijn indices.")) {
+                if (!lexer_next(&l)) goto again;
+                if (l.token == TOKEN_END) {
+                    output_debruijn_indices = !output_debruijn_indices;
+                } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "on") == 0) {
+                    output_debruijn_indices = true;
+                    if (!lexer_expect(&l, TOKEN_END)) goto again;
+                } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "off") == 0) {
+                    output_debruijn_indices = false;
+                    if (!lexer_expect(&l, TOKEN_END)) goto again;
+                } else {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: Expected `on`, `off`, or no argument after :debruijn\n");
+                    goto again;
+                }
+                printf("De Bruijn indices output: %s\n", output_debruijn_indices ? "ON" : "OFF");
                 goto again;
             }
             if (command(&commands, l.string.items, "ast", "<expr>", "print the AST of the expression")) {
@@ -1388,7 +1755,7 @@ again:
 
         if (is_binding) {
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
-            Symbol name = symbol(l.string.items);
+            const char *name = intern_label(l.string.items);
             Expr_Index body;
             if (!parse_binding_body(&l, &body)) goto again;
             if (!lexer_expect(&l, TOKEN_END)) goto again;
@@ -1400,7 +1767,7 @@ again:
         if (!parse_expr(&l, &expr)) goto again;
         if (!lexer_expect(&l, TOKEN_END)) goto again;
         for (size_t i = bindings.count; i > 0; --i) {
-            expr = replace(bindings.items[i-1].name, expr, bindings.items[i-1].body);
+            expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);
         }
 
         ctrl_c = 0;

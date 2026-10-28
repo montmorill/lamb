@@ -41,26 +41,43 @@ The syntax is based on the [Notation of Untype Lambda Calculus](https://en.wikip
 
 ### Variables
 
-Variables are any alphanumeric names:
+Variable names may contain letters, digits, `_`, `?`, `-`, and `'`:
 
 ```
 @> :ast x
 [VAR] x
 @> :ast hello69
 [VAR] hello69
-@> :ast 69420
-[VAR] 69420
+@> :ast is-empty?
+[VAR] is-empty?
+@> :ast x'
+[VAR] x'
 @>
 ```
 
-Yes, fully numeric sequences of characters are also considered names, because they are alphanumeric. This may change in the future.
+A name cannot start with a digit. A token that starts with a digit is a [De Bruijn index](#de-bruijn-indices) instead, and mixing digits with name characters is an error:
+
+```
+@> :ast 69
+[VAR] 69
+@> :ast 1abc
+1:6: ERROR: A name cannot start with a digit
+@>
+```
+
+Unicode letters and digits are also accepted as name characters, as long as the first character is not a digit. The interpreter tries UTF-8 locales first and falls back to the system locale, delegating the classification of non-ASCII characters to the C library's `iswalnum`, so exactly which characters qualify depends on the platform. Error locations count characters rather than bytes.
+
+`λ` is reserved as the lambda operator and cannot be used in a name.
 
 ### Functions
 
-To denote functions instead of small greek lambda `λ` we use backslash `\` (this may change in the future, we are considering allowing `λ` as an alternative):
+To denote functions we use backslash `\`. The Greek small lambda `λ` is accepted as an equivalent alternative:
 
 ```
 @> :ast \x.x
+[FUN] \x
++--[VAR] x
+@> :ast λx.x
 [FUN] \x
 +--[VAR] x
 @> :ast \x.\y.x
@@ -104,6 +121,94 @@ Instead we allow you to drop consequent backslashes turning the dot `.` into a p
    +--[VAR] x
 @>
 ```
+
+The parameter may be omitted entirely with `\.`, which creates an anonymous binder. Its variable can then only be referred to by index:
+
+```
+@> :ast \.0
+[FUN] \.
++--[VAR] 0
+@> \x.\.1
+RESULT: \x.\.x
+@>
+```
+
+### De Bruijn Indices
+
+Internally, bound variables are De Bruijn indices; names only exist for our convenience. A numeric token is an index: number the surrounding binders from the inside out starting at `0`, and every index smaller than the number of binders refers to the corresponding binder:
+
+```
+@> \x.\y.x
+RESULT: \x.\y.x
+@> \x.\y.1
+RESULT: \x.\y.x
+@> \x.\y.y
+RESULT: \x.\y.y
+@> \x.\y.0
+RESULT: \x.\y.y
+@>
+```
+
+When printing, a variable is shown by the name of its binder whenever possible. If the binder is anonymous or its name is shadowed by a closer binder with the same name, the index is printed instead:
+
+```
+@> \x.\x.1
+RESULT: \x.\x.1
+@> \x.\.0
+RESULT: \x.\.0
+@> :ast \x.\.0
+[FUN] \x
++--[FUN] \.
+   +--[VAR] 0
+@>
+```
+
+Substitution avoids capture by renaming binders when necessary. Here the free `y` would be captured by the binder `\y`, so the binder is renamed:
+
+```
+@> (\x.\y.x) y
+RESULT: \y_1.y
+@>
+```
+
+A number that is at least as large as the number of surrounding binders denotes a free variable. When such an index is printed, it is shifted by the number of binders, so that a term means the same thing after being saved and loaded again:
+
+```
+@> :ast 0
+[VAR] 0
+@> :ast \x.1
+[FUN] \x
++--[VAR] 1
+@>
+```
+
+The free variable written `0` at the top level is written `1` under one binder. The same shift applies to numeric atoms introduced through bindings, which are substituted textually:
+
+```
+@> a = 42
+Created binding a
+@> \x.a
+RESULT: \x.43
+@>
+```
+
+Use names rather than numbers for constants and free values to avoid this shift.
+
+To print every bound variable as an index, use the `:debruijn` command. With no argument it toggles the current setting; `:debruijn on` and `:debruijn off` set it explicitly:
+
+```
+@> :debruijn
+De Bruijn indices output: ON
+@> \x.\y.x
+RESULT: \x.\y.1
+@> :debruijn off
+De Bruijn indices output: OFF
+@> \x.\y.x
+RESULT: \x.\y.x
+@>
+```
+
+Forced mode also affects `:ast`, `:save`, and `:list` output.
 
 ## Applications
 
