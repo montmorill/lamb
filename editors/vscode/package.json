@@ -1,8 +1,8 @@
 {
   "name": "lamb-language",
   "displayName": "Lamb",
-  "description": "Syntax highlighting and language configuration for the Lamb language.",
-  "version": "0.1.0",
+  "description": "Syntax highlighting and Lean-style Unicode input for the Lamb language.",
+  "version": "0.4.0",
   "publisher": "montmorill",
   "license": "MIT",
   "repository": {
@@ -15,7 +15,61 @@
   "categories": [
     "Programming Languages"
   ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:lamb",
+    "onCommand:lamb.input.convert",
+    "onCommand:lamb.input.insertSymbol"
+  ],
   "contributes": {
+    "commands": [
+      {
+        "command": "lamb.input.convert",
+        "title": "Convert Unicode Abbreviation",
+        "category": "Lamb"
+      },
+      {
+        "command": "lamb.input.insertSymbol",
+        "title": "Insert Unicode Symbol",
+        "category": "Lamb"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "lamb.input.convert",
+        "key": "tab",
+        "when": "editorTextFocus && editorLangId == lamb && lamb.input.isActive"
+      },
+      {
+        "command": "lamb.input.insertSymbol",
+        "key": "ctrl+alt+\\",
+        "mac": "cmd+alt+\\",
+        "when": "editorTextFocus && editorLangId == lamb"
+      }
+    ],
+    "configuration": {
+      "title": "Lamb",
+      "properties": {
+        "lamb.input.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Lean-style Unicode abbreviation input in Lamb files."
+        },
+        "lamb.input.leader": {
+          "type": "string",
+          "default": "\\",
+          "description": "Single character that starts an abbreviation (default: backslash)."
+        },
+        "lamb.input.customTranslations": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra abbreviations, e.g. {\"foo\": \"\u263a\"} makes \\foo insert \u263a."
+        }
+      }
+    },
     "languages": [
       {
         "id": "lamb",
