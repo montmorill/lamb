@@ -912,6 +912,9 @@ typedef enum {
     TOKEN_NAME,
     TOKEN_INDEX,
     TOKEN_MAGIC,
+    TOKEN_OPEN,
+    TOKEN_IN,
+    TOKEN_SECTION,
 } Token_Kind;
 
 const char *token_kind_display(Token_Kind kind)
@@ -929,6 +932,9 @@ const char *token_kind_display(Token_Kind kind)
     case TOKEN_NAME:      return "TOKEN_NAME";
     case TOKEN_INDEX:     return "TOKEN_INDEX";
     case TOKEN_MAGIC:     return "TOKEN_MAGIC";
+    case TOKEN_OPEN:      return "`open`";
+    case TOKEN_IN:        return "`in`";
+    case TOKEN_SECTION:   return "`section`";
     default: UNREACHABLE("Token_Kind");
     }
 }
@@ -1106,13 +1112,15 @@ bool is_digit_cp(uint32_t cp)
 
 // Whether `cp` may appear in a name. ASCII letters and digits are always
 // accepted; non-ASCII letters and digits are accepted when the C library's
-// locale knows them (see init_name_locale()). `_`, `?`, `-`, and `'` are
-// always accepted, while `λ` is reserved for the lambda operator.
+// locale knows them (see init_name_locale()). `_`, `?`, `-`, `'`, and `/` are
+// always accepted, while `λ` is reserved for the lambda operator. `/` is the
+// namespace separator (`list/filter`); it cannot start a name, and `//` still
+// starts a comment.
 bool is_name_cp(uint32_t cp)
 {
     if (cp == 0x03BB) return false;
     if (cp < 0x80) {
-        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'';
+        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'' || cp == '/';
     }
     if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
     return iswalnum((wint_t) cp) != 0;
@@ -1121,6 +1129,12 @@ bool is_name_cp(uint32_t cp)
 void lexer_read_name_chars(Lexer *l)
 {
     for (;;) {
+        // `//` starts a comment even when it follows name characters, so
+        // `foo//bar` is the name `foo` followed by a comment.
+        if (l->cur.pos + 1 < l->count &&
+            l->content[l->cur.pos] == '/' && l->content[l->cur.pos + 1] == '/') {
+            break;
+        }
         uint32_t cp = 0;
         size_t len = decode_utf8(l->content + l->cur.pos, l->count - l->cur.pos, &cp);
         if (len == 0 || !is_name_cp(cp)) break;
@@ -1249,7 +1263,10 @@ bool lexer_next(Lexer *l)
         return true;
     }
 
-    if (is_name_cp(cp) && !is_digit_cp(cp)) {
+    // `/` belongs to names only after the first character, so a leading slash
+    // is still an unknown token. This keeps `//` comments and raw file paths
+    // unambiguous.
+    if (is_name_cp(cp) && !is_digit_cp(cp) && cp != '/') {
         l->token = TOKEN_NAME;
         l->string.count = 0;
         for (size_t i = 0; i < len; ++i) {
@@ -1257,6 +1274,16 @@ bool lexer_next(Lexer *l)
         }
         lexer_read_name_chars(l);
         sb_append_null(&l->string);
+        // `open`, `in`, and `section` are reserved keywords. They are lexed
+        // after the whole name run is read, so qualified names such as
+        // `list/open` stay names.
+        if (strcmp(l->string.items, "open") == 0) {
+            l->token = TOKEN_OPEN;
+        } else if (strcmp(l->string.items, "in") == 0) {
+            l->token = TOKEN_IN;
+        } else if (strcmp(l->string.items, "section") == 0) {
+            l->token = TOKEN_SECTION;
+        }
         return true;
     }
 
@@ -1299,9 +1326,131 @@ bool lexer_expect(Lexer *l, Token_Kind expected)
     return true;
 }
 
-bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr);
+// `open`, `in`, and `section` are reserved, so they are never accepted where a
+// name is expected. Returns true (after reporting) when the current token is
+// one of them, letting callers fall back to their generic error otherwise.
+bool report_reserved_keyword(Lexer *l)
+{
+    const char *keyword = NULL;
+    switch (l->token) {
+    case TOKEN_OPEN:    keyword = "open";    break;
+    case TOKEN_IN:      keyword = "in";      break;
+    case TOKEN_SECTION: keyword = "section"; break;
+    default: return false;
+    }
+    lexer_print_loc(l, stderr);
+    fprintf(stderr, "ERROR: `%s` is a reserved keyword\n", keyword);
+    return true;
+}
 
-bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
+typedef struct {
+    const char *name;
+    Expr_Index body;
+} Binding;
+
+typedef struct {
+    Binding *items;
+    size_t count;
+    size_t capacity;
+} Bindings;
+
+// Namespaces opened with `open`. Opening is not a lexical scope: it only tells
+// the parser how to expand an unqualified name that is not a binding on its own.
+typedef struct {
+    const char **items;
+    size_t count;
+    size_t capacity;
+} Opens;
+
+typedef struct {
+    Bindings *bindings;
+    Opens *opens;
+    // The active `section`, or NULL for the empty section. Bindings defined
+    // while a section is active are prefixed with `section/`, and unqualified
+    // names in their bodies resolve into that section first.
+    const char *section;
+} Parse_Context;
+
+bool binding_exists(const Bindings *bindings, const char *name)
+{
+    for (size_t i = 0; i < bindings->count; ++i) {
+        if (bindings->items[i].name == name) return true;
+    }
+    return false;
+}
+
+// Expands `name` through the opened namespaces. A name that is defined either
+// bare or in exactly one opened namespace resolves to that binding; a qualified
+// name, or one that no opened namespace defines, stays as written. Returns
+// false when several bindings match, reporting the two conflicting names.
+bool resolve_open_name(Parse_Context *ctx, const char *name, const char **result, const char **conflict)
+{
+    if (strchr(name, '/') != NULL) {
+        *result = intern_label(name);
+        return true;
+    }
+
+    static String_Builder sb = {0};
+
+    // The active section is the innermost scope: a member of the section wins
+    // over a bare binding or an opened namespace of the same name.
+    if (ctx->section) {
+        sb.count = 0;
+        sb_appendf(&sb, "%s/%s", ctx->section, name);
+        sb_append_null(&sb);
+        const char *member = intern_label(sb.items);
+        if (binding_exists(ctx->bindings, member)) {
+            *result = member;
+            return true;
+        }
+    }
+
+    const char *found = NULL;
+    if (binding_exists(ctx->bindings, name)) found = intern_label(name);
+
+    for (size_t i = 0; i < ctx->opens->count; ++i) {
+        sb.count = 0;
+        sb_appendf(&sb, "%s/%s", ctx->opens->items[i], name);
+        sb_append_null(&sb);
+        const char *qualified = intern_label(sb.items);
+        if (!binding_exists(ctx->bindings, qualified)) continue;
+        if (found == NULL) {
+            found = qualified;
+        } else if (found != qualified) {
+            *result = found;
+            *conflict = qualified;
+            return false;
+        }
+    }
+
+    *result = found ? found : intern_label(name);
+    return true;
+}
+
+// A trailing `/` would make the qualified definition name end with `//`, which
+// the lexer would read back as the start of a comment.
+bool section_name_valid(const char *name)
+{
+    size_t len = strlen(name);
+    return len > 0 && name[len - 1] != '/';
+}
+
+// Prefixes a new binding name with the active section. A name that already
+// contains `/` is fully qualified and is kept as written; sections do not
+// nest, so nothing else needs to be resolved here.
+const char *qualify_name(const char *section, const char *name)
+{
+    if (section == NULL || strchr(name, '/') != NULL) return name;
+    static String_Builder sb = {0};
+    sb.count = 0;
+    sb_appendf(&sb, "%s/%s", section, name);
+    sb_append_null(&sb);
+    return intern_label(sb.items);
+}
+
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr);
+
+bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
 {
     const char *param = NULL;
     if (!lexer_next(l)) return false;
@@ -1312,6 +1461,7 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
         param = intern_label(l->string.items);
         if (!lexer_expect(l, TOKEN_DOT)) return false;
     } else {
+        if (report_reserved_keyword(l)) return false;
         lexer_print_loc(l, stderr);
         fprintf(stderr, "ERROR: Unexpected token %s. Expected a parameter name or `.` instead.\n",
                 token_kind_display(l->token));
@@ -1337,8 +1487,8 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
     da_append(scope, param);
     Expr_Index body;
     bool ok = shorthand
-        ? parse_fun_scope(l, scope, &body)
-        : parse_expr_scope(l, scope, &body);
+        ? parse_fun_scope(l, scope, ctx, &body)
+        : parse_expr_scope(l, scope, ctx, &body);
     scope->count -= 1;
     if (!ok) return false;
 
@@ -1346,16 +1496,16 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
     return true;
 }
 
-bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
+bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
 {
     if (!lexer_next(l)) return false;
     switch (l->token) {
     case TOKEN_OPAREN: {
-        if (!parse_expr_scope(l, scope, expr)) return false;
+        if (!parse_expr_scope(l, scope, ctx, expr)) return false;
         if (!lexer_expect(l, TOKEN_CPAREN)) return false;
         return true;
     }
-    case TOKEN_LAMBDA: return parse_fun_scope(l, scope, expr);
+    case TOKEN_LAMBDA: return parse_fun_scope(l, scope, ctx, expr);
     case TOKEN_MAGIC:
         *expr = magic(l->string.items);
         return true;
@@ -1369,26 +1519,80 @@ bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
         return true;
     }
     case TOKEN_NAME: {
-        const char *label = intern_label(l->string.items);
+        const char *name = intern_label(l->string.items);
+
         for (size_t i = scope->count; i > 0; --i) {
-            if (scope->items[i - 1] == label) {
+            if (scope->items[i - 1] == name) {
                 *expr = bound_var(scope->count - i);
                 return true;
             }
         }
-        *expr = free_var(label);
+        const char *resolved = NULL;
+        const char *conflict = NULL;
+        if (!resolve_open_name(ctx, name, &resolved, &conflict)) {
+            lexer_print_loc(l, stderr);
+            fprintf(stderr, "ERROR: Name `%s` is ambiguous between `%s` and `%s`\n",
+                    name, resolved, conflict);
+            return false;
+        }
+        *expr = free_var(resolved);
+        return true;
+    }
+    case TOKEN_OPEN: {
+        // `open ns ... in expr` scopes the named namespaces to `expr`. `open`
+        // is reserved, so there is no fallback to an ordinary variable name.
+        size_t base = ctx->opens->count;
+        bool saw_in = false;
+
+        for (;;) {
+            if (!lexer_next(l)) {
+                ctx->opens->count = base;
+                return false;
+            }
+            if (l->token == TOKEN_IN) {
+                saw_in = true;
+                break;
+            }
+            if (l->token != TOKEN_NAME) break;
+            da_append(ctx->opens, intern_label(l->string.items));
+        }
+
+        if (!saw_in) {
+            lexer_print_loc(l, stderr);
+            if (ctx->opens->count == base) {
+                fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
+            } else {
+                fprintf(stderr, "ERROR: Expected `in` after the namespaces of `open`\n");
+            }
+            ctx->opens->count = base;
+            return false;
+        }
+
+        if (ctx->opens->count == base) {
+            lexer_print_loc(l, stderr);
+            fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
+            ctx->opens->count = base;
+            return false;
+        }
+
+        Expr_Index body;
+        bool ok = parse_expr_scope(l, scope, ctx, &body);
+        ctx->opens->count = base;
+        if (!ok) return false;
+        *expr = body;
         return true;
     }
     default:
+        if (report_reserved_keyword(l)) return false;
         lexer_print_loc(l, stderr);
         fprintf(stderr, "ERROR: Unexpected token %s. Expected a primary expression instead.\n", token_kind_display(l->token));
         return false;
     }
 }
 
-bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
 {
-    if (!parse_primary_scope(l, scope, expr)) return false;
+    if (!parse_primary_scope(l, scope, ctx, expr)) return false;
 
     if (!lexer_peek(l)) return false;
     while (
@@ -1397,21 +1601,21 @@ bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
         l->token != TOKEN_SEMICOLON
     ) {
         Expr_Index rhs;
-        if (!parse_primary_scope(l, scope, &rhs)) return false;
+        if (!parse_primary_scope(l, scope, ctx, &rhs)) return false;
         *expr = app(*expr, rhs);
         if (!lexer_peek(l)) return false;
     }
     return true;
 }
 
-bool parse_expr(Lexer *l, Expr_Index *expr)
+bool parse_expr(Lexer *l, Parse_Context *ctx, Expr_Index *expr)
 {
     static Binder_Stack scope = {0};
     scope.count = 0;
-    return parse_expr_scope(l, &scope, expr);
+    return parse_expr_scope(l, &scope, ctx, expr);
 }
 
-bool parse_binding_body(Lexer *l, Expr_Index *body)
+bool parse_binding_body(Lexer *l, Parse_Context *ctx, Expr_Index *body)
 {
     // NOTE: the parameters of a binding are just syntactic sugar for nested lambdas.
     // `f x y = body;` is equivalent to `f = \x.y.body;`
@@ -1425,11 +1629,12 @@ bool parse_binding_body(Lexer *l, Expr_Index *body)
     }
 
     if (l->token != TOKEN_EQUALS) {
+        if (report_reserved_keyword(l)) return false;
         report_unexpected(l, TOKEN_EQUALS);
         return false;
     }
 
-    if (!parse_expr_scope(l, &scope, body)) return false;
+    if (!parse_expr_scope(l, &scope, ctx, body)) return false;
 
     for (size_t i = scope.count; i > 0; --i) {
         *body = fun(scope.items[i - 1], *body);
@@ -1513,17 +1718,6 @@ void gc_mark(Expr_Index root)
     }
 }
 
-typedef struct {
-    const char *name;
-    Expr_Index body;
-} Binding;
-
-typedef struct {
-    Binding *items;
-    size_t count;
-    size_t capacity;
-} Bindings;
-
 void create_binding(Bindings *bindings, const char *name, Expr_Index body)
 {
     for (size_t i = 0; i < bindings->count; ++i) {
@@ -1545,6 +1739,12 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
 {
     static String_Builder sb = {0};
     static Lexer l = {0};
+    static Opens opens = {0};
+
+    // `open` in a binding file is scoped to that file. Loading a file does not
+    // change the namespaces the REPL itself has open.
+    opens.count = 0;
+    Parse_Context ctx = {bindings, &opens, NULL};
 
     sb.count = 0;
     if (!read_entire_file(file_path, &sb)) return false;
@@ -1553,12 +1753,71 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
 
     if (!lexer_peek(&l)) return false;
     while (l.token != TOKEN_END) {
+        if (l.token == TOKEN_OPEN) {
+            if (!lexer_expect(&l, TOKEN_OPEN)) return false;
+            if (!lexer_next(&l)) return false;
+
+            size_t base = opens.count;
+            while (l.token == TOKEN_NAME) {
+                da_append(&opens, intern_label(l.string.items));
+                if (!lexer_next(&l)) return false;
+            }
+
+            if (opens.count == base) {
+                lexer_print_loc(&l, stderr);
+                fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
+                return false;
+            }
+            if (l.token == TOKEN_IN) {
+                lexer_print_loc(&l, stderr);
+                fprintf(stderr, "ERROR: `open ... in ...` is an expression, not a binding-file statement\n");
+                return false;
+            }
+            if (l.token != TOKEN_SEMICOLON) {
+                report_unexpected(&l, TOKEN_SEMICOLON);
+                return false;
+            }
+            if (!lexer_peek(&l)) return false;
+            continue;
+        }
+
+        // `section name;` prefixes the following definitions with `name/` and
+        // lets them refer to each other unqualified. A bare `section;` returns
+        // to the empty section. Sections do not nest: `section` replaces the
+        // current one.
+        if (l.token == TOKEN_SECTION) {
+            if (!lexer_expect(&l, TOKEN_SECTION)) return false;
+            if (!lexer_next(&l)) return false;
+            if (l.token == TOKEN_NAME) {
+                const char *section = intern_label(l.string.items);
+                if (!section_name_valid(section)) {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: A section name cannot end with `/`\n");
+                    return false;
+                }
+                ctx.section = section;
+                if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
+            } else if (l.token == TOKEN_SEMICOLON) {
+                ctx.section = NULL;
+            } else {
+                lexer_print_loc(&l, stderr);
+                fprintf(stderr, "ERROR: Expected a section name or `;` after `section`\n");
+                return false;
+            }
+            if (!lexer_peek(&l)) return false;
+            continue;
+        }
+
+        if (l.token == TOKEN_IN) {
+            report_reserved_keyword(&l);
+            return false;
+        }
         if (!lexer_expect(&l, TOKEN_NAME)) return false;
         const char *name = intern_label(l.string.items);
         Expr_Index body;
-        if (!parse_binding_body(&l, &body)) return false;
+        if (!parse_binding_body(&l, &ctx, &body)) return false;
         if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
-        create_binding(bindings, name, body);
+        create_binding(bindings, qualify_name(ctx.section, name), body);
         if (!lexer_peek(&l)) return false;
     }
     return true;
@@ -1989,7 +2248,7 @@ Key input_read_key(void)
 
 bool is_completion_name_byte(unsigned char c)
 {
-    return is_ascii_alnum(c) || c == '_' || c == '?' || c == '-' || c == '\'' || c >= 0x80;
+    return is_ascii_alnum(c) || c == '_' || c == '?' || c == '-' || c == '\'' || c == '/' || c >= 0x80;
 }
 
 size_t completion_word_start(const Input_Line *line)
@@ -2406,6 +2665,8 @@ int main(int argc, char **argv)
     static char buffer[1024];
     static Bindings bindings = {0};
     static Lexer l = {0};
+    static Opens session_opens = {0};
+    Parse_Context ctx = {&bindings, &session_opens, NULL};
 
     init_name_locale();
 
@@ -2591,7 +2852,7 @@ again:
             }
             if (command(l.string.items, "debug")) {
                 Expr_Index expr;
-                if (!parse_expr(&l, &expr)) goto again;
+                if (!parse_expr(&l, &ctx, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 for (size_t i = bindings.count; i > 0; --i) {
                     expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);
@@ -2695,7 +2956,7 @@ again:
             }
             if (command(l.string.items, "ast")) {
                 Expr_Index expr;
-                if (!parse_expr(&l, &expr)) goto again;
+                if (!parse_expr(&l, &ctx, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 dump_expr_ast(expr);
                 goto again;
@@ -2707,6 +2968,86 @@ again:
             }
             print_available_commands();
             printf("ERROR: unknown command `%s`\n", l.string.items);
+            goto again;
+        }
+
+        // `in` is reserved and cannot start a statement.
+        if (l.token == TOKEN_IN) {
+            report_reserved_keyword(&l);
+            goto again;
+        }
+
+        // `open ns;` (or just `open ns`) opens namespaces for the rest of the
+        // REPL session. `open ns in expr` opens them only while parsing expr,
+        // so it is handled as an expression below.
+        if (l.token == TOKEN_OPEN) {
+            Cur before_open = l.cur;
+            if (!lexer_expect(&l, TOKEN_OPEN)) goto again;
+            if (!lexer_next(&l)) goto again;
+
+            size_t base = session_opens.count;
+            bool open_in = false;
+            while (l.token == TOKEN_NAME) {
+                da_append(&session_opens, intern_label(l.string.items));
+                if (!lexer_next(&l)) goto again;
+            }
+            if (l.token == TOKEN_IN) open_in = true;
+
+            if (open_in) {
+                if (session_opens.count == base) {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
+                    goto again;
+                }
+                session_opens.count = base;
+                l.cur = before_open;
+            } else {
+                if (session_opens.count == base) {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
+                    goto again;
+                }
+                if (l.token == TOKEN_SEMICOLON) {
+                    if (!lexer_next(&l)) goto again;
+                }
+                if (l.token != TOKEN_END) {
+                    session_opens.count = base;
+                    report_unexpected(&l, TOKEN_END);
+                    goto again;
+                }
+                for (size_t i = base; i < session_opens.count; ++i) {
+                    printf("Opened namespace %s\n", session_opens.items[i]);
+                }
+                goto again;
+            }
+        }
+
+        // `section name` prefixes the following definitions with `name/` and
+        // lets them refer to each other unqualified. A bare `section` returns
+        // to the empty section. The semicolon is optional in the REPL.
+        if (l.token == TOKEN_SECTION) {
+            if (!lexer_expect(&l, TOKEN_SECTION)) goto again;
+            if (!lexer_next(&l)) goto again;
+            const char *section = NULL;
+            if (l.token == TOKEN_NAME) {
+                section = intern_label(l.string.items);
+                if (!section_name_valid(section)) {
+                    lexer_print_loc(&l, stderr);
+                    fprintf(stderr, "ERROR: A section name cannot end with `/`\n");
+                    goto again;
+                }
+                if (!lexer_next(&l)) goto again;
+            }
+            if (l.token == TOKEN_SEMICOLON) {
+                if (!lexer_next(&l)) goto again;
+            }
+            if (l.token != TOKEN_END) {
+                report_unexpected(&l, TOKEN_END);
+                goto again;
+            }
+            ctx.section = section;
+            if (section) printf("Entered section %s\n", section);
+            else printf("Closed section\n");
             goto again;
         }
 
@@ -2726,14 +3067,14 @@ again:
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
             const char *name = intern_label(l.string.items);
             Expr_Index body;
-            if (!parse_binding_body(&l, &body)) goto again;
+            if (!parse_binding_body(&l, &ctx, &body)) goto again;
             if (!lexer_expect(&l, TOKEN_END)) goto again;
-            create_binding(&bindings, name, body);
+            create_binding(&bindings, qualify_name(ctx.section, name), body);
             goto again;
         }
 
         Expr_Index expr;
-        if (!parse_expr(&l, &expr)) goto again;
+        if (!parse_expr(&l, &ctx, &expr)) goto again;
         if (!lexer_expect(&l, TOKEN_END)) goto again;
         for (size_t i = bindings.count; i > 0; --i) {
             expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);

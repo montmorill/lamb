@@ -7,6 +7,9 @@
     { "include": "#colon-command" },
     { "include": "#lambda" },
     { "include": "#backslash" },
+    { "include": "#open" },
+    { "include": "#section" },
+    { "include": "#keyword" },
     { "include": "#definition" },
     { "include": "#magic" },
     { "include": "#punctuation" },
@@ -32,14 +35,18 @@
 
     "lambda": {
       "name": "meta.function.lambda.lamb",
-      "begin": "(\\\\|λ)(?=\\s*(?:(?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+\\s*\\.|\\.))",
+      "begin": "(\\\\|λ)(?=\\s*(?:(?!(?:open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]]))(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+\\s*\\.|\\.))",
       "beginCaptures": {
         "1": { "name": "keyword.operator.lambda.lamb" }
       },
-      "end": "(?!\\s*\\.)(?!\\s*[\\p{L}\\p{N}_?'\\-&&[^λ]]+\\s*\\.)",
+      "end": "(?!\\s*\\.)(?!\\s*(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+\\s*\\.)",
       "patterns": [
         {
-          "match": "(?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+(?=\\s*\\.)",
+          "match": "(?<![\\p{L}\\p{N}_?'/\\-&&[^λ]])(open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]])",
+          "name": "keyword.control.lamb"
+        },
+        {
+          "match": "(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+(?=\\s*\\.)",
           "name": "variable.parameter.lamb"
         },
         {
@@ -54,20 +61,63 @@
       "name": "keyword.operator.lambda.lamb"
     },
 
+    "open": {
+      "patterns": [
+        {
+          "match": "(?<![\\p{L}\\p{N}_?'/\\-])(open)((?:\\s+(?!(?:open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]]))(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+)+)(\\s+)(in)(?![\\p{L}\\p{N}_?'/\\-])",
+          "captures": {
+            "1": { "name": "keyword.control.open.lamb" },
+            "2": { "name": "entity.name.namespace.lamb" },
+            "4": { "name": "keyword.control.in.lamb" }
+          }
+        },
+        {
+          "match": "(?<![\\p{L}\\p{N}_?'/\\-])(open)((?:\\s+(?!(?:open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]]))(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+)+)(?=\\s*;)",
+          "captures": {
+            "1": { "name": "keyword.control.open.lamb" },
+            "2": { "name": "entity.name.namespace.lamb" }
+          }
+        }
+      ]
+    },
+
+    "section": {
+      "patterns": [
+        {
+          "match": "(?<![\\p{L}\\p{N}_?'/\\-])(section)((?:\\s+(?!(?:open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]]))(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+))?(?=\\s*;)",
+          "captures": {
+            "1": { "name": "keyword.control.section.lamb" },
+            "2": { "name": "entity.name.namespace.lamb" }
+          }
+        }
+      ]
+    },
+
+    "keyword": {
+      "match": "(?<![\\p{L}\\p{N}_?'/\\-&&[^λ]])(open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]])",
+      "captures": {
+        "1": { "name": "keyword.control.lamb" }
+      }
+    },
+
     "definition": {
       "name": "meta.function.definition.lamb",
-      "begin": "(?<![\\p{L}\\p{N}_?'\\-.])((?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+)(?=(?:\\s+(?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+)*\\s*=)",
+      "begin": "(?<![\\p{L}\\p{N}_?'/\\-.])((?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+)(?=(?:\\s+(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+)*\\s*=)",
       "beginCaptures": {
         "1": { "name": "entity.name.function.definition.lamb" }
       },
       "end": "(?=\\s*=)",
       "patterns": [
-        { "match": "(?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+", "name": "variable.parameter.lamb" }
+        {
+          "match": "(?<![\\p{L}\\p{N}_?'/\\-&&[^λ]])(open|in|section)(?![\\p{L}\\p{N}_?'/\\-&&[^λ]])",
+          "name": "keyword.control.lamb"
+        },
+        { "match": "(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+", "name": "variable.parameter.lamb" }
       ]
     },
 
     "magic": {
-      "match": "#[\\p{L}\\p{N}_?'\\-&&[^λ]]*",
+      "match": "#(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))*",
       "name": "support.function.magic.lamb"
     },
 
@@ -82,12 +132,12 @@
     },
 
     "debruijn-index": {
-      "match": "(?<![\\p{L}\\p{N}_?'\\-])[0-9]+(?![\\p{L}\\p{N}_?'\\-])",
+      "match": "(?<![\\p{L}\\p{N}_?'/\\-])[0-9]+(?![\\p{L}\\p{N}_?'/\\-])",
       "name": "constant.numeric.debruijn.lamb"
     },
 
     "variable": {
-      "match": "(?![\\p{Nd}])[\\p{L}\\p{N}_?'\\-&&[^λ]]+",
+      "match": "(?![\\p{Nd}/])(?:[\\p{L}\\p{N}_?'\\-&&[^λ]]|/(?!/))+",
       "name": "variable.other.lamb"
     }
   }

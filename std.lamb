@@ -1,91 +1,112 @@
+// Bindings are namespaced by type: bool/, pair/, nat/, list/, and option/.
+// A definition may reference only bindings declared above it, because the REPL
+// substitutes bindings from the bottom of the file upwards.
+
 id    x   = x;
 const x _ = x;
 
 // CBool : a -> a -> a
-tru t f = t;
-fls t f = f;
-and p q = p q fls;
-or  p q = p tru q;
-not p   = p fls tru;
-xor p q = p (not q) q;
+bool/tru t f = t;
+bool/fls t f = f;
+bool/and p q = p q bool/fls;
+bool/or  p q = p bool/tru q;
+bool/not p   = p bool/fls bool/tru;
+bool/xor p q = p (bool/not q) q;
 
 // Pair : a -> a -> CBool -> a
-pair x y p = p x y;
-fst p = p tru;
-snd p = p fls;
-step f p = pair (f (fst p)) (fst p);
+pair/make x y p = p x y;
+pair/fst p = p bool/tru;
+pair/snd p = p bool/fls;
+pair/step f p = pair/make (f (pair/fst p)) (pair/fst p);
 
 // CNat : (a -> a) -> a -> a
-zero   f z = z;
-succ n f z = f (n f z);
-one   = succ zero;
-two   = succ one;
-three = succ two;
-four  = succ three;
-five  = succ four;
-six   = succ five;
-seven = succ six;
-eight = succ seven;
-nine  = succ eight;
-ten   = succ nine;
-is-zero n = n (const fls) tru;
-is-even n = n not tru;
-add m n = n succ m;
-mul m n = n (add m) zero;
-pow m n = n (mul m) one;
-pred n = snd (n (step succ) (pair zero zero));
-sub m n = n pred m;
-is-odd n = n not fls;
-le m n = is-zero (sub m n);
-lt m n = le (succ m) n;
-ge m n = le n m;
-gt m n = lt n m;
-eqb m n = and (le m n) (le n m);
-min m n = sub m (sub m n);
-max m n = add n (sub m n);
+nat/zero   f z = z;
+nat/succ n f z = f (n f z);
+nat/one   = nat/succ nat/zero;
+nat/two   = nat/succ nat/one;
+nat/three = nat/succ nat/two;
+nat/four  = nat/succ nat/three;
+nat/five  = nat/succ nat/four;
+nat/six   = nat/succ nat/five;
+nat/seven = nat/succ nat/six;
+nat/eight = nat/succ nat/seven;
+nat/nine  = nat/succ nat/eight;
+nat/ten   = nat/succ nat/nine;
+nat/is-zero n = n (const bool/fls) bool/tru;
+nat/is-even n = n bool/not bool/tru;
+nat/add m n = n nat/succ m;
+nat/mul m n = n (nat/add m) nat/zero;
+nat/pow m n = n (nat/mul m) nat/one;
+nat/pred n = pair/snd (n (pair/step nat/succ) (pair/make nat/zero nat/zero));
+nat/sub m n = n nat/pred m;
+nat/is-odd n = n bool/not bool/fls;
+nat/le m n = nat/is-zero (nat/sub m n);
+nat/lt m n = nat/le (nat/succ m) n;
+nat/ge m n = nat/le n m;
+nat/gt m n = nat/lt n m;
+nat/eqb m n = bool/and (nat/le m n) (nat/le n m);
+nat/min m n = nat/sub m (nat/sub m n);
+nat/max m n = nat/add n (nat/sub m n);
 // Long division, one unit of the dividend per step. The accumulator pair is
-// destructured exactly once per step: touching it through fst/snd more than
-// once re-evaluates the whole step chain, which is exponential here since this
-// evaluator does not share normal-order reductions.
-div-step n p = p (λq.r. eqb (succ r) n
-                           (pair (succ q) zero)
-                           (pair q (succ r)));
-// div-mod m n = pair quotient remainder, computed in m steps; n must be non-zero.
-div-mod m n = m (div-step n) (pair zero zero);
-div m n = fst (div-mod m n);
-mod m n = snd (div-mod m n);
+// destructured exactly once per step: touching it through pair/fst/pair/snd
+// more than once re-evaluates the whole step chain, which is exponential here
+// since this evaluator does not share normal-order reductions.
+nat/div-step n p = p (λq.r. nat/eqb (nat/succ r) n
+                          (pair/make (nat/succ q) nat/zero)
+                          (pair/make q (nat/succ r)));
+// div-mod m n = pair of (quotient, remainder), computed in m steps; n must be non-zero.
+nat/div-mod m n = m (nat/div-step n) (pair/make nat/zero nat/zero);
+nat/div m n = pair/fst (nat/div-mod m n);
+nat/mod m n = pair/snd (nat/div-mod m n);
 
-// CList a : (a → r → r) → r → r
-nil       f z = z;
-cons x xs f z = f x (xs f z);
-is-nil xs = xs (λ..fls) tru;
-length xs = xs (const succ) zero;
-head xs = xs const nil;
-tail xs = snd (xs (λh. step (cons h)) (pair nil nil));
-reverse xs = xs (λx.acc.ys. acc (cons x ys)) id nil;
+// CList a : (a -> r -> r) -> r -> r
+list/nil       f z = z;
+list/cons x xs f z = f x (xs f z);
+list/is-nil xs = xs (λ..bool/fls) bool/tru;
+list/length xs = xs (const nat/succ) nat/zero;
+list/head xs = xs const list/nil;
+list/tail xs = pair/snd (xs (λh. pair/step (list/cons h)) (pair/make list/nil list/nil));
+list/reverse xs = xs (λx.acc.ys. acc (list/cons x ys)) id list/nil;
 
-append xs ys = xs cons ys;
-singleton x = cons x nil;
-snoc xs x = append xs (singleton x);
-map f xs = xs (λx.acc. cons (f x) acc) nil;
-filter p xs = xs (λx.acc. p x (cons x acc) acc) nil;
-foldr f z xs = xs f z;
-foldl f z xs = xs (λx.g.z'. g (f z' x)) id z;
-any p xs = xs (λx.acc. p x tru acc) fls;
-all p xs = xs (λx.acc. p x acc fls) tru;
-sum xs = xs add zero;
-product xs = xs mul one;
-concat xss = xss append nil;
-count p xs = length (filter p xs);
-// elem? takes a curried equality predicate, for example `eqb`.
-elem? eq x xs = any (eq x) xs;
+list/append xs ys = xs list/cons ys;
+list/singleton x = list/cons x list/nil;
+list/snoc xs x = list/append xs (list/singleton x);
+list/map f xs = xs (λx.acc. list/cons (f x) acc) list/nil;
+list/filter p xs = xs (λx.acc. p x (list/cons x acc) acc) list/nil;
+list/foldr f z xs = xs f z;
+list/foldl f z xs = xs (λx.g.z'. g (f z' x)) id z;
+list/any p xs = xs (λx.acc. p x bool/tru acc) bool/fls;
+list/all p xs = xs (λx.acc. p x acc bool/fls) bool/tru;
+list/sum xs = xs nat/add nat/zero;
+list/product xs = xs nat/mul nat/one;
+list/concat xss = xss list/append list/nil;
+list/count p xs = list/length (list/filter p xs);
+// elem? takes a curried equality predicate, for example `nat/eqb`.
+list/elem? eq x xs = list/any (eq x) xs;
 // partition returns a pair of (matching, non-matching) lists.
-partition p xs = pair (filter p xs) (filter (λx. not (p x)) xs);
-replicate n x = n (cons x) nil;
-drop n xs = n tail xs;
-nth n xs = head (drop n xs);
+list/partition p xs = pair/make (list/filter p xs) (list/filter (λx. bool/not (p x)) xs);
+list/replicate n x = n (list/cons x) list/nil;
+list/drop n xs = n list/tail xs;
+list/nth n xs = list/head (list/drop n xs);
 // The fold cannot stop early, so take trims from the reversed end.
-take n xs = reverse (drop (sub (length xs) n) (reverse xs));
-last xs = head (reverse xs);
-init xs = reverse (tail (reverse xs));
-split-at n xs = pair (take n xs) (drop n xs);
+list/take n xs = list/reverse (list/drop (nat/sub (list/length xs) n) (list/reverse xs));
+list/last xs = list/head (list/reverse xs);
+list/init xs = list/reverse (list/tail (list/reverse xs));
+list/split-at n xs = pair/make (list/take n xs) (list/drop n xs);
+
+// Option : (a -> r) -> r -> r
+option/none   s n = n;
+option/some x s n = s x;
+// Option combinators. `option/none` and `option/some` are the constructors.
+option/is-none o = o (const bool/fls) bool/tru;
+option/is-some o = o (const bool/tru) bool/fls;
+// Returns the payload, or d for none.
+option/from-some d o = o id d;
+option/map f o = o (λx. option/some (f x)) option/none;
+// f must return an Option; none stays none.
+option/bind f o = o f option/none;
+// p is a CBool predicate on the payload.
+option/filter p o = o (λx. p x (option/some x) option/none) option/none;
+// o itself if it is some, otherwise d.
+option/or-else o d = o option/some d;
+option/to-list o = o (λx. list/cons x list/nil) list/nil;

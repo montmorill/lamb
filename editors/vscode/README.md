@@ -11,6 +11,9 @@ server, no build step.
 - Syntax highlighting for `.lamb` files
 - Completion for binding names, `:` commands, and `#` magics
 - Binding parameters (`plus n m = ...`) highlighted like lambda parameters
+- `open`, `in`, and `section` highlighted as reserved keywords everywhere; an
+  `open ns ... in` header or a `section ns;` statement additionally scopes the
+  namespace names as `entity.name.namespace.lamb`
 - De Bruijn indices (`0`, `1`, ...) highlighted as numeric constants
 - Anonymous binders (`\.`) highlighted like other lambda binders
 - Bracket matching and auto-closing for `(` `)`
@@ -51,11 +54,16 @@ replacement only happens when you explicitly press Tab.
 - `lamb.input.enabled` turns the mechanism off.
 
 The full built-in table lives in `abbreviations.json`. Names may contain `_`,
-`?`, `-`, and `'`, as well as Unicode letters and digits such as `α` or
+`?`, `-`, `'`, and `/`, as well as Unicode letters and digits such as `α` or
 `变量_1`; a name cannot start with a digit, since digit-initial tokens are De
-Bruijn indices. `λ` is not a name character: it is the lambda operator,
-equivalent to `\`. Other Unicode symbols such as `∀` or `→` are only valid
-inside comments.
+Bruijn indices, nor with `/`. `λ` is not a name character: it is the lambda
+operator, equivalent to `\`. Other Unicode symbols such as `∀` or `→` are only
+valid inside comments. `/` is a conventional namespace separator (`list/filter`,
+`option/map`), but it is an ordinary character with no scoping semantics; `//`
+still starts a comment, so a name never contains a double slash. `open`, `in`,
+and `section` are reserved keywords: they cannot be variable names, parameters,
+or binding names, although a qualified name such as `list/open` is still an
+ordinary name.
 The interpreter classifies non-ASCII name characters with the C library's
 `iswalnum` after selecting a UTF-8 locale when one is available, so the exact
 set can differ slightly from the grammar's Unicode classes.
@@ -85,7 +93,9 @@ converts the abbreviation instead.
 
 Completion is disabled inside `//` comments. Binding names are read from the
 current document and from `std.lamb`; other files in the workspace are not
-scanned. Binding definitions use `name = body`.
+scanned. Binding definitions use `name = body`. Matching is a literal prefix
+from the start of the name, so typing `list/` narrows the list to that
+namespace; typing only `filter` does not surface `list/filter`.
 
 ## Develop
 
@@ -131,13 +141,31 @@ not start with a digit, the name rules use a `(?![\\p{Nd}])` lookahead;
 sequences such as `hello69` are still single names, while invalid tokens such as
 `1abc` are deliberately not highlighted as either kind of token.
 
-Names are matched with `[\p{L}\p{N}_?'\-&&[^λ]]+` (Unicode letters and numbers
-plus `_`, `?`, `-`, and `'`, excluding the reserved `λ`). The grammar accepts
-the full Unicode set; the interpreter's non-ASCII set comes from the C
-library's `iswalnum` and can be slightly narrower.
+A name starts with a Unicode letter or number, `_`, `?`, `-`, or `'` (never a
+digit or `/`), followed by those characters or a single `/` that is not the
+start of `//`:
+
+```
+(?![\\p{Nd}/])(?:[\\p{L}\p{N}_?'\\-&&[^λ]]|/(?!/))+
+```
+
+Excluding the reserved `λ` and refusing `//` keeps `//` comments out of names.
+The grammar accepts the full Unicode set; the interpreter's non-ASCII set comes
+from the C library's `iswalnum` and can be slightly narrower.
+
+`open`, `in`, and `section` are reserved keywords. Every name rule refuses the
+exact tokens with `(?!(?:open|in|section)(?![\p{L}\p{N}_?'/-]))`, and a separate
+rule scopes them as `keyword.control.lamb` (the `open ... in`, `open ... ;`, and
+`section ... ;` headers are matched first so their namespace names stay
+`entity.name.namespace.lamb`). A qualified name such as `list/open` is not the
+keyword and remains a variable.
 
 ### Known limitations
 
 - A lambda or binding header split across lines (the `.` or `=` on the following
   line) may not stay in one region, because VS Code tokenizes line by line.
 - REPL transcript text such as `:save main.lamb` colors the filename as variables.
+- Completion lists binding names literally and does not expand namespaces opened
+  with `open`, so an unqualified `filter` is not suggested because of
+  `open list;`. Type the qualified name, or its `list/` prefix, to get
+  completion.

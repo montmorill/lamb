@@ -14,15 +14,15 @@ $ ./lamb ./std.lamb
 ,---@>
  W-W'
 Enter :help for more info
-@> pair foo (pair bar baz)
+@> pair/make foo (pair/make bar baz)
 RESULT: \b.b foo (\b.b bar baz)
-@> xs = pair foo (pair bar baz)
+@> xs = pair/make foo (pair/make bar baz)
 Created binding xs
-@> fst xs
+@> pair/fst xs
 RESULT: foo
-@> snd xs
+@> pair/snd xs
 RESULT: \b.b bar baz
-@> fst (snd xs)
+@> pair/fst (pair/snd xs)
 RESULT: bar
 @>
 ```
@@ -43,7 +43,7 @@ The syntax is based on the [Notation of Untype Lambda Calculus](https://en.wikip
 
 ### Variables
 
-Variable names may contain letters, digits, `_`, `?`, `-`, and `'`:
+Variable names may contain letters, digits, `_`, `?`, `-`, `'`, and `/`:
 
 ```
 @> :ast x
@@ -54,6 +54,8 @@ Variable names may contain letters, digits, `_`, `?`, `-`, and `'`:
 [VAR] is-empty?
 @> :ast x'
 [VAR] x'
+@> :ast list/filter
+[VAR] list/filter
 @>
 ```
 
@@ -70,6 +72,17 @@ A name cannot start with a digit. A token that starts with a digit is a [De Brui
 Unicode letters and digits are also accepted as name characters, as long as the first character is not a digit. The interpreter tries UTF-8 locales first and falls back to the system locale, delegating the classification of non-ASCII characters to the C library's `iswalnum`, so exactly which characters qualify depends on the platform. Error locations count characters rather than bytes.
 
 `λ` is reserved as the lambda operator and cannot be used in a name.
+
+`/` is a namespace separator by convention, as in `list/filter` or
+`option/map`. It is an ordinary name character: the language does not scope
+names by it, so `list/filter` is just a name that happens to contain a slash. A
+name cannot start with `/`. Since `//` starts a comment, a name run stops before
+it, so `foo// note` is the name `foo` followed by a comment.
+
+`open`, `in`, and `section` are reserved keywords. They cannot be used as
+variable names, lambda parameters, or binding names. Only the exact tokens are
+reserved: qualified names that merely contain them, such as `list/open`, are
+still ordinary names.
 
 ### Functions
 
@@ -341,15 +354,13 @@ RESULT: ((f a) b) c
 
 ```console
 $ ./lamb ./std.lamb
-@> xs = cons 69 (cons 420 (cons 1337 (cons foo (cons bar (cons bar nil)))))
+@> xs = list/cons foo (list/cons bar (list/cons baz (list/cons quux list/nil)))
 Created binding xs
-@> #void (trace_list xs)
-TRACE: 69
-TRACE: 420
-TRACE: 1337
+@> #void (list/map #trace xs)
 TRACE: foo
 TRACE: bar
-TRACE: bar
+TRACE: baz
+TRACE: quux
 RESULT: #void
 ```
 
@@ -431,6 +442,112 @@ DEBUG: g (g (g (g (g (g (g (g ((\x.g (x x)) (\x.g (x x))))))))))
 ...
 ```
 
+### Opening Namespaces
+
+`open` brings the members of a namespace into scope, so that an unqualified name
+resolves to `namespace/name` when that binding exists:
+
+```
+@> :load std.lamb
+...
+@> open nat;
+Opened namespace nat
+@> nat/eqb (add two three) five foo bar
+RESULT: foo
+```
+
+Opening affects only how names are read; it does not create aliases or change
+the names of new bindings. A local lambda parameter still wins over an opened
+name. `open`, `in`, and `section` are reserved keywords, so unlike plain names they cannot
+be shadowed by a parameter or used as a binding name.
+
+Several namespaces can be opened at once:
+
+```
+@> open list nat;
+Opened namespace list
+Opened namespace nat
+@> eqb (length (filter is-odd (replicate five one))) five foo bar
+RESULT: foo
+```
+
+If a name is defined in more than one open namespace (or both bare and in an
+open namespace), the interpreter reports an ambiguity. Qualify the name to
+disambiguate:
+
+```
+@> open list option;
+Opened namespace list
+Opened namespace option
+@> :ast filter
+1:6: ERROR: Name `filter` is ambiguous between `list/filter` and `option/filter`
+@> :ast list/filter
+[VAR] list/filter
+```
+
+`open ... in ...` limits the opening to a single expression:
+
+```
+@> eqb (add two three) five foo bar
+RESULT: eqb (add two three) five foo bar
+@> open nat in eqb (add two three) five foo bar
+RESULT: foo
+```
+
+The body of `open ... in` extends as far right as possible, like a lambda; use
+parentheses to limit it. An unqualified name that no opened namespace defines is
+left as written, so `id` keeps working while `nat` is open.
+
+In a binding file `open` lasts until the end of that file and is scoped to it:
+loading a file does not change the namespaces the REPL has open. In the REPL it
+lasts until the session ends. The semicolon after `open` is required in a
+binding file and optional in the REPL.
+
+Opening does not add aliases to Tab completion: completion still works on the
+full binding names, so type `nat/` to complete `nat/add`.
+
+### Sections
+
+`section` declares the namespace for the definitions that follow. It prefixes
+their names and lets them refer to each other without repeating the prefix:
+
+```
+@> :load std.lamb
+...
+@> section list;
+Entered section list
+@> twin x = cons x (cons x nil)
+Created binding list/twin
+@> :list list/twin
+list/twin = \x.list/cons x (list/cons x list/nil);
+@> section;
+Closed section
+```
+
+Inside a section, an unqualified name resolves to a member of the section
+first. If the section has no such member, the name falls back to a bare binding
+and then to the opened namespaces, so a section member shadows a binding of the
+same name defined elsewhere. A local lambda parameter still wins over both.
+
+Sections do not nest: `section` replaces the current section instead of nesting
+inside it, and `section` without a name returns to the empty section. The name
+itself may be qualified, in which case it is used as written:
+
+```
+@> section foo/bar;
+Entered section foo/bar
+@> nil f z = z
+Created binding foo/bar/nil
+```
+
+A definition whose name already contains `/` is treated as fully qualified and
+is not prefixed again. Since a section only prefixes new binding names and
+opens the section for reading, it can be used freely together with `open`. In a
+binding file a section lasts until the next `section` statement or the end of
+the file; the semicolon is required there and optional in the REPL. `section`
+is a reserved keyword, so unlike a plain name it cannot be shadowed by a
+parameter or used as a binding name.
+
 ### Managing the Bindings Files
 
 You can save current bindings to a file with `:save` command:
@@ -479,7 +596,9 @@ Repeating `:load` or `:save` without an argument applies it the last saved or lo
 
 Use `:edit` command to open and edit the bindings file in an external editor. The default editor is `vi` but you can set it with `$EDITOR` and `$LAMB_EDITOR` environment variable.
 
-We provided a bunch of useful bindings in [std.lamb][./std.lamb].
+We provided a bunch of useful bindings in [std.lamb][./std.lamb]. They are
+grouped by Church-encoded type: `bool/`, `pair/`, `nat/`, `list/`, and
+`option/`; only `id` and `const` are unprefixed.
 
 Passing a file as a command line argument to the interpreter acts as if you instantly `:load`-ed it.
 

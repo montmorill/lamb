@@ -14,8 +14,8 @@ const builtinTranslations = require('./abbreviations.json');
 
 const CONTEXT_KEY = 'lamb.input.isActive';
 const ABBREVIATION_CHAR = /[A-Za-z0-9_=<>!+\-*/^|]/;
-const NAME_CHAR = /[\p{L}\p{N}_?'-]/u;
-const DEFINITION_NAME = /^(?![\p{Nd}])[\p{L}\p{N}_?'-]+/u;
+const NAME_CHAR = /[\p{L}\p{N}_?'/-]/u;
+const DEFINITION_NAME = /^(?!(?:open|in|section)(?![\p{L}\p{N}_?'/-]))(?![\p{Nd}/])[\p{L}\p{N}_?'/-]+/u;
 
 // [name, signature, description]. The signatures must match the ones the
 // interpreter prints in `:help`; argument completion is derived from them.
