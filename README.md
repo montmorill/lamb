@@ -500,8 +500,8 @@ left as written, so `id` keeps working while `nat` is open.
 
 In a binding file `open` lasts until the end of that file and is scoped to it:
 loading a file does not change the namespaces the REPL has open. In the REPL it
-lasts until the session ends. The semicolon after `open` is required in a
-binding file and optional in the REPL.
+lasts until the session ends. The semicolon after `open` is optional; without
+it the statement ends at the line break.
 
 Opening does not add aliases to Tab completion: completion still works on the
 full binding names, so type `nat/` to complete `nat/add`.
@@ -544,9 +544,9 @@ A definition whose name already contains `/` is treated as fully qualified and
 is not prefixed again. Since a section only prefixes new binding names and
 opens the section for reading, it can be used freely together with `open`. In a
 binding file a section lasts until the next `section` statement or the end of
-the file; the semicolon is required there and optional in the REPL. `section`
-is a reserved keyword, so unlike a plain name it cannot be shadowed by a
-parameter or used as a binding name.
+the file. The semicolon is optional; without it the statement ends at the line
+break. `section` is a reserved keyword, so unlike a plain name it cannot be
+shadowed by a parameter or used as a binding name.
 
 ### Managing the Bindings Files
 
