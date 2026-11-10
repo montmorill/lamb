@@ -67,7 +67,7 @@ open nat
 section list // CList a : (a -> r -> r) -> r -> r
 nil       f z = z;
 cons x xs f z = f x (xs f z);
-is-nil xs = xs (λ..fls) tru;
+is-nil xs = xs (λ_._.fls) tru;
 length xs = xs (const succ) zero;
 head xs = xs const nil;
 tail xs = snd (xs (λh. step (cons h)) (pair nil nil));
