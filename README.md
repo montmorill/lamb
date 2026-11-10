@@ -571,8 +571,12 @@ A definition whose name already contains `/` is treated as fully qualified and
 is not prefixed again. Since a section only prefixes new binding names and
 opens the section for reading, it can be used freely together with `open`. In a
 binding file a section lasts until the next `section` statement or the end of
-the file. The semicolon is optional; without it the statement ends at the line
-break. `section` is a reserved keyword, so unlike a plain name it cannot be
+the file. After `section name` the semicolon is optional; without it the
+statement ends at the line break. A bare `section`, which closes the current
+section, does need the semicolon in a binding file (`section;`), because
+otherwise the next definition's name would be read as the section name. In the
+REPL the bare `section` needs no semicolon, since the input ends at the line.
+`section` is a reserved keyword, so unlike a plain name it cannot be
 shadowed by a parameter or used as a binding name.
 
 ### Managing the Bindings Files
