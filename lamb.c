@@ -1830,7 +1830,7 @@ again:
                 static String_Builder sb = {0};
                 sb.count = 0;
                 for (size_t i = 0; i < bindings.count; ++i) {
-                    sb_appendf(&sb, "%s := ", bindings.items[i].name);
+                    sb_appendf(&sb, "%s = ", bindings.items[i].name);
                     expr_display(bindings.items[i].body, &sb);
                     sb_appendf(&sb, ";\n");
                 }
@@ -1895,7 +1895,7 @@ again:
                 if (args.count == 0) {
                     for (size_t i = 0; i < bindings.count; ++i) {
                         sb.count = 0;
-                        sb_appendf(&sb, "%s := ", bindings.items[i].name);
+                        sb_appendf(&sb, "%s = ", bindings.items[i].name);
                         expr_display(bindings.items[i].body, &sb);
                         sb_appendf(&sb, ";");
                         sb_append_null(&sb);
@@ -1910,7 +1910,7 @@ again:
                     for (size_t i = 0; !found && i < bindings.count; ++i) {
                         if (bindings.items[i].name == label) {
                             sb.count = 0;
-                            sb_appendf(&sb, "%s := ", bindings.items[i].name);
+                            sb_appendf(&sb, "%s = ", bindings.items[i].name);
                             expr_display(bindings.items[i].body, &sb);
                             sb_appendf(&sb, ";");
                             sb_append_null(&sb);
@@ -2097,7 +2097,7 @@ again:
             goto again;
         }
 
-        // NOTE: `name arg1 arg2 := body` is a binding definition.
+        // NOTE: `name arg1 arg2 = body` is a binding definition.
         bool is_binding = false;
         Cur cur = l.cur; {
             if (!lexer_next(&l)) goto again;
