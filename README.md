@@ -37,13 +37,23 @@ On systems where the built-in editor is unavailable (for example a Windows
 console emulator that does not expose a console handle), [rlwrap](https://github.com/hanslub42/rlwrap)
 still provides Bash-style history and line navigation.
 
+## Tests
+
+`tests/utf8-names.sh` checks the lexer's handling of Unicode identifiers. Build
+the interpreter first, then run the script from the repository root:
+
+```console
+$ cc -o lamb lamb.c
+$ tests/utf8-names.sh
+```
+
 ## Syntax
 
 The syntax is based on the [Notation of Untype Lambda Calculus](https://en.wikipedia.org/wiki/Lambda_calculus_definition#Notation) and provides few improvements over it.
 
 ### Variables
 
-Variable names may contain letters, digits, `_`, `?`, `-`, `'`, and `/`:
+Variable names may contain ASCII letters and digits, `_`, `?`, `-`, `'`, and `/`:
 
 ```
 @> :ast x
@@ -59,7 +69,7 @@ Variable names may contain letters, digits, `_`, `?`, `-`, `'`, and `/`:
 @>
 ```
 
-A name cannot start with a digit. A token that starts with a digit is a [De Bruijn index](#de-bruijn-indices) instead, and mixing digits with name characters is an error:
+A name cannot start with an ASCII digit. A token that starts with an ASCII digit is a [De Bruijn index](#de-bruijn-indices) instead, and mixing digits with name characters is an error:
 
 ```
 @> :ast 69
@@ -69,7 +79,7 @@ A name cannot start with a digit. A token that starts with a digit is a [De Brui
 @>
 ```
 
-Unicode letters and digits are also accepted as name characters, as long as the first character is not a digit. The interpreter tries UTF-8 locales first and falls back to the system locale, delegating the classification of non-ASCII characters to the C library's `iswalnum`, so exactly which characters qualify depends on the platform. Error locations count characters rather than bytes.
+Any non-ASCII character is also accepted in a name, except whitespace, control characters, and invisible formatting characters such as zero-width spaces and bidirectional controls. The rule uses neither the C library's locale nor a Unicode table, so names behave the same on every platform and cover every Unicode plane, including characters outside the Basic Multilingual Plane such as `𝐀` (U+1D400). Because the language's syntax is entirely ASCII, non-ASCII punctuation and emoji are valid name characters too. Only ASCII digits form De Bruijn indices; other Unicode digits are ordinary name characters. Error locations count characters rather than bytes.
 
 `λ` is reserved as the lambda operator and cannot be used in a name.
 

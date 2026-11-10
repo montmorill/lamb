@@ -8,10 +8,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
-#include <locale.h>
 #include <signal.h>
 #include <stdint.h>
-#include <wctype.h>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -949,20 +947,6 @@ size_t count_chars(const char *s, size_t n)
     return count;
 }
 
-// Selects a locale for iswalnum(), which classifies non-ASCII name
-// characters. The lexer decodes UTF-8 itself; the locale is only used for
-// classification. Prefer a UTF-8 locale and fall back to the system one.
-void init_name_locale(void)
-{
-    static const char *const candidates[] = {
-        "C.UTF-8", ".UTF-8", "en_US.UTF-8", "UTF-8", ".utf8",
-    };
-    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
-        if (setlocale(LC_CTYPE, candidates[i])) return;
-    }
-    setlocale(LC_CTYPE, "");
-}
-
 bool is_ascii_alnum(uint32_t cp)
 {
     return (cp >= '0' && cp <= '9') ||
@@ -970,30 +954,59 @@ bool is_ascii_alnum(uint32_t cp)
            (cp >= 'A' && cp <= 'Z');
 }
 
-// Whether `cp` is a digit. Digits cannot start a name: they are de Bruijn
+// ASCII characters accepted anywhere in a name. Digits are included; the
+// lexer rejects them as the first character because they are de Bruijn
 // indices instead.
+bool is_ascii_name_cp(uint32_t cp)
+{
+    return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'' || cp == '/';
+}
+
+// Whether `cp` is an ASCII digit. Only ASCII digits are de Bruijn indices, so
+// only they are rejected as the first character of a name; other Unicode
+// digits are ordinary name characters.
 bool is_digit_cp(uint32_t cp)
 {
-    if (cp >= '0' && cp <= '9') return true;
-    if (cp < 0x80) return false;
-    if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
-    return iswdigit((wint_t) cp) != 0;
+    return cp >= '0' && cp <= '9';
+}
+
+// Non-ASCII characters that cannot appear in a name: whitespace, control
+// characters, and invisible formatting characters. Everything else above
+// ASCII is accepted, so this rule needs no Unicode table or locale and
+// behaves the same on every platform, including characters outside the Basic
+// Multilingual Plane.
+bool is_non_name_cp(uint32_t cp)
+{
+    return cp == 0x00A0 ||                    // no-break space
+           cp == 0x00AD ||                    // soft hyphen
+           (cp >= 0x0080 && cp <= 0x009F) ||  // C1 controls
+           cp == 0x061C ||                    // Arabic letter mark
+           cp == 0x1680 ||                    // ogham space mark
+           cp == 0x180E ||                    // Mongolian vowel separator
+           (cp >= 0x2000 && cp <= 0x200F) ||  // spaces, zero-width characters, bidi marks
+           (cp >= 0x2028 && cp <= 0x202F) ||  // separators, bidi controls, narrow no-break space
+           cp == 0x205F ||                    // medium mathematical space
+           (cp >= 0x2060 && cp <= 0x206F) ||  // invisible operators and isolates
+           cp == 0x3000 ||                    // ideographic space
+           cp == 0xFEFF ||                    // byte order mark
+           (cp >= 0xFFF9 && cp <= 0xFFFB) ||  // interlinear annotation
+           (cp >= 0xE0000 && cp <= 0xE007F);  // language tags
 }
 
 // Whether `cp` may appear in a name. ASCII letters and digits are always
-// accepted; non-ASCII letters and digits are accepted when the C library's
-// locale knows them (see init_name_locale()). `_`, `?`, `-`, `'`, and `/` are
-// always accepted, while `λ` is reserved for the lambda operator. `/` is the
-// namespace separator (`list/filter`); it cannot start a name, and `//` still
-// starts a comment.
+// accepted, as are `_`, `?`, `-`, `'`, and `/`. Any other non-ASCII character
+// is accepted unless it is whitespace, a control character, or an invisible
+// formatting character (see is_non_name_cp()), so combining marks and
+// characters outside the Basic Multilingual Plane work too. `λ` is reserved
+// for the lambda operator. `/` is the namespace separator (`list/filter`); it
+// cannot start a name, and `//` still starts a comment.
 bool is_name_cp(uint32_t cp)
 {
     if (cp == 0x03BB) return false;
     if (cp < 0x80) {
-        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'' || cp == '/';
+        return is_ascii_name_cp(cp);
     }
-    if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
-    return iswalnum((wint_t) cp) != 0;
+    return !is_non_name_cp(cp);
 }
 
 void lexer_read_name_chars(Lexer *l)
@@ -1155,14 +1168,6 @@ bool lexer_next(Lexer *l)
             l->token = TOKEN_SECTION;
         }
         return true;
-    }
-
-    if (is_name_cp(cp) && is_digit_cp(cp)) {
-        for (size_t i = 0; i < len; ++i) lexer_next_char(l);
-        l->token = TOKEN_INVALID;
-        lexer_print_loc(l, stderr);
-        fprintf(stderr, "ERROR: A name cannot start with a digit `%.*s`\n", (int) len, l->content + start);
-        return false;
     }
 
     for (size_t i = 0; i < len; ++i) lexer_next_char(l);
@@ -1802,8 +1807,6 @@ int main(int argc, char **argv)
     static Opens session_opens = {0};
     static Lexer l = {0};
     Parse_Context ctx = {&bindings, &session_opens, NULL};
-
-    init_name_locale();
 
 #ifndef _WIN32
     // TODO(20251221-171559): Handle ctrl+c on Windows
