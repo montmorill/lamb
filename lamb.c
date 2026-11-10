@@ -18,14 +18,12 @@
 #    define _WINUSER_
 #    define _WINGDI_
 #    define _IMM_
+#    define _WINCON_
 #    include <windows.h>
-#    include <conio.h>
 #else
 #    include <unistd.h>
 #    include <sys/wait.h>
 #    include <sys/stat.h>
-#    include <termios.h>
-#    include <sys/select.h>
 #endif // _WIN32
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -436,60 +434,9 @@ typedef struct {
     size_t capacity;
 } Binder_Stack;
 
-typedef enum {
-    // Print bound variables by the name of their binder when possible.
-    DEBRUIJN_OFF,
-    // Print every bound variable as an index, but keep binder names.
-    DEBRUIJN_ON,
-    // Print every binder as `\.` and every variable as an index, so the
-    // output contains no names at all.
-    DEBRUIJN_FULL,
-} Debruijn_Mode;
-
-// Selected by the `:set debruijn` command.
-static Debruijn_Mode debruijn_mode = DEBRUIJN_OFF;
-
-// Selected by the `:set unicode` command.
-static bool unicode_mode = false;
-
-// Selected by the `:set shorthand` command. When enabled, chained named
-// binders are printed in the `\x.y.body` shorthand accepted by the parser.
-static bool shorthand_mode = false;
-
-const char *debruijn_mode_name(Debruijn_Mode mode)
-{
-    switch (mode) {
-    case DEBRUIJN_OFF:  return "OFF";
-    case DEBRUIJN_ON:   return "ON";
-    case DEBRUIJN_FULL: return "FULL";
-    default: UNREACHABLE("Debruijn_Mode");
-    }
-}
-
-// The operator printed for binders. `λ` is valid input as well, so output
-// produced in Unicode mode can be loaded back.
-const char *lambda_symbol(void)
-{
-    return unicode_mode ? "\xce\xbb" : "\\";
-}
-
-typedef struct {
-    const char **items;
-    size_t count;
-    size_t capacity;
-} Free_Name_Stack;
-
-// Free variables have no binder that could give them an index. In FULL mode
-// they are numbered by first appearance instead, as if the free variables
-// formed an outer context. This is what makes the output completely nameless.
-size_t free_name_index(Free_Name_Stack *stack, const char *label)
-{
-    for (size_t i = 0; i < stack->count; ++i) {
-        if (stack->items[i] == label) return i;
-    }
-    da_append(stack, label);
-    return stack->count - 1;
-}
+// Toggled by the `:debruijn` command. When true every bound variable is
+// printed as an index instead of the name of its binder.
+static bool output_debruijn_indices = false;
 
 bool has_free_name(Expr_Index expr, const char *label)
 {
@@ -540,63 +487,41 @@ bool bound_name_is_shadowed(Binder_Stack *stack, size_t index)
     return false;
 }
 
-void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack,
-                        Free_Name_Stack *free_names)
+void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack)
 {
     switch (expr_slot(expr).kind) {
     case EXPR_FREE_NAME:
-        if (debruijn_mode == DEBRUIJN_FULL) {
-            sb_appendf(sb, "%zu",
-                       stack->count + free_name_index(free_names, expr_slot(expr).as.free_name));
-        } else {
-            sb_appendf(sb, "%s", expr_slot(expr).as.free_name);
-        }
+        sb_appendf(sb, "%s", expr_slot(expr).as.free_name);
         break;
     case EXPR_FREE_INDEX:
         sb_appendf(sb, "%zu", stack->count + expr_slot(expr).as.free_index);
         break;
     case EXPR_BOUND: {
         size_t index = expr_slot(expr).as.bound;
-        if (debruijn_mode == DEBRUIJN_OFF && !bound_name_is_shadowed(stack, index)) {
+        if (!output_debruijn_indices && !bound_name_is_shadowed(stack, index)) {
             sb_appendf(sb, "%s", stack->items[stack->count - 1 - index]);
         } else {
             sb_appendf(sb, "%zu", index);
         }
     } break;
     case EXPR_FUN: {
-        size_t pushed = 0;
-        bool first = true;
-        // Walk the whole chain of binders so that `:set shorthand` can omit
-        // the symbol of every binder after the first one. The elided form is
-        // the same shorthand the parser accepts for named and anonymous
-        // binders alike.
-        while (expr_slot(expr).kind == EXPR_FUN) {
-            const char *param = expr_slot(expr).as.fun.param;
-            Expr_Index body = expr_slot(expr).as.fun.body;
-            const char *name = debruijn_mode == DEBRUIJN_FULL
-                ? NULL
-                : display_binder_name(param, body);
-            if (!shorthand_mode || first) {
-                sb_appendf(sb, "%s", lambda_symbol());
-            }
-            if (name) {
-                sb_appendf(sb, "%s.", name);
-            } else {
-                sb_appendf(sb, ".");
-            }
-            da_append(stack, name);
-            pushed++;
-            expr = body;
-            first = false;
+        const char *param = expr_slot(expr).as.fun.param;
+        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
+        sb_appendf(sb, "\\");
+        if (name) {
+            sb_appendf(sb, "%s.", name);
+        } else {
+            sb_appendf(sb, ".");
         }
-        expr_display_scope(expr, sb, stack, free_names);
-        stack->count -= pushed;
+        da_append(stack, name);
+        expr_display_scope(expr_slot(expr).as.fun.body, sb, stack);
+        stack->count -= 1;
     } break;
     case EXPR_APP: {
         Expr_Index lhs = expr_slot(expr).as.app.lhs;
         bool lhs_paren = expr_slot(lhs).kind == EXPR_FUN;
         if (lhs_paren) sb_appendf(sb, "(");
-        expr_display_scope(lhs, sb, stack, free_names);
+        expr_display_scope(lhs, sb, stack);
         if (lhs_paren) sb_appendf(sb, ")");
 
         sb_appendf(sb, " ");
@@ -607,7 +532,7 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
                          expr_slot(rhs).kind != EXPR_FREE_INDEX &&
                          expr_slot(rhs).kind != EXPR_MAG;
         if (rhs_paren) sb_appendf(sb, "(");
-        expr_display_scope(rhs, sb, stack, free_names);
+        expr_display_scope(rhs, sb, stack);
         if (rhs_paren) sb_appendf(sb, ")");
     } break;
     case EXPR_MAG:
@@ -620,14 +545,11 @@ void expr_display_scope(Expr_Index expr, String_Builder *sb, Binder_Stack *stack
 void expr_display(Expr_Index expr, String_Builder *sb)
 {
     static Binder_Stack stack = {0};
-    static Free_Name_Stack free_names = {0};
     stack.count = 0;
-    free_names.count = 0;
-    expr_display_scope(expr, sb, &stack, &free_names);
+    expr_display_scope(expr, sb, &stack);
 }
 
-void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
-                         Free_Name_Stack *free_names)
+void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders)
 {
     static struct {
         bool *items;
@@ -649,19 +571,14 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
 
     switch (expr_slot(expr).kind) {
     case EXPR_FREE_NAME:
-        if (debruijn_mode == DEBRUIJN_FULL) {
-            printf("[VAR] %zu\n",
-                   binders->count + free_name_index(free_names, expr_slot(expr).as.free_name));
-        } else {
-            printf("[VAR] %s\n", expr_slot(expr).as.free_name);
-        }
+        printf("[VAR] %s\n", expr_slot(expr).as.free_name);
         break;
     case EXPR_FREE_INDEX:
         printf("[VAR] %zu\n", binders->count + expr_slot(expr).as.free_index);
         break;
     case EXPR_BOUND: {
         size_t index = expr_slot(expr).as.bound;
-        if (debruijn_mode == DEBRUIJN_OFF && !bound_name_is_shadowed(binders, index)) {
+        if (!output_debruijn_indices && !bound_name_is_shadowed(binders, index)) {
             printf("[VAR] %s\n", binders->items[binders->count - 1 - index]);
         } else {
             printf("[VAR] %zu\n", index);
@@ -669,27 +586,25 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
     } break;
     case EXPR_FUN: {
         const char *param = expr_slot(expr).as.fun.param;
-        const char *name = debruijn_mode == DEBRUIJN_FULL
-            ? NULL
-            : display_binder_name(param, expr_slot(expr).as.fun.body);
+        const char *name = display_binder_name(param, expr_slot(expr).as.fun.body);
         if (name) {
-            printf("[FUN] %s%s\n", lambda_symbol(), name);
+            printf("[FUN] \\%s\n", name);
         } else {
-            printf("[FUN] %s.\n", lambda_symbol());
+            printf("[FUN] \\.\n");
         }
         da_append(binders, name);
         da_append(&stack, false); {
-            dump_expr_ast_scope(expr_slot(expr).as.fun.body, binders, free_names);
+            dump_expr_ast_scope(expr_slot(expr).as.fun.body, binders);
         } stack.count -= 1;
         binders->count -= 1;
     } break;
     case EXPR_APP:
         printf("[APP]\n");
         da_append(&stack, true); {
-            dump_expr_ast_scope(expr_slot(expr).as.app.lhs, binders, free_names);
+            dump_expr_ast_scope(expr_slot(expr).as.app.lhs, binders);
         } stack.count -= 1;
         da_append(&stack, false); {
-            dump_expr_ast_scope(expr_slot(expr).as.app.rhs, binders, free_names);
+            dump_expr_ast_scope(expr_slot(expr).as.app.rhs, binders);
         } stack.count -= 1;
         break;
     case EXPR_MAG:
@@ -703,25 +618,15 @@ void dump_expr_ast_scope(Expr_Index expr, Binder_Stack *binders,
 void dump_expr_ast(Expr_Index expr)
 {
     static Binder_Stack binders = {0};
-    static Free_Name_Stack free_names = {0};
     binders.count = 0;
-    free_names.count = 0;
-    dump_expr_ast_scope(expr, &binders, &free_names);
+    dump_expr_ast_scope(expr, &binders);
 }
-
-// The binders the evaluator is currently under. eval1() pushes a binder while
-// it normalizes that function's body, so that a `#trace` inside the body can
-// print bound variables by name instead of asserting on an index that has no
-// entry in the display stack.
-static Binder_Stack eval_binders = {0};
 
 void trace_expr(Expr_Index expr)
 {
     static String_Builder sb = {0};
-    static Free_Name_Stack free_names = {0};
     sb.count = 0;
-    free_names.count = 0;
-    expr_display_scope(expr, &sb, &eval_binders, &free_names);
+    expr_display(expr, &sb);
     sb_append_null(&sb);
     printf("%s", sb.items);
 }
@@ -826,18 +731,9 @@ bool eval1(Expr_Index expr, Expr_Index *expr1)
         return true;
     case EXPR_FUN: {
         Expr_Index body;
-        const char *param = expr_slot(expr).as.fun.param;
-        // Only the OFF mode prints names; the other modes print indices, so
-        // they don't need the (potentially expensive) capture check.
-        const char *name = debruijn_mode == DEBRUIJN_OFF
-            ? display_binder_name(param, expr_slot(expr).as.fun.body)
-            : NULL;
-        da_append(&eval_binders, name);
-        bool ok = eval1(expr_slot(expr).as.fun.body, &body);
-        eval_binders.count -= 1;
-        if (!ok) return false;
+        if (!eval1(expr_slot(expr).as.fun.body, &body)) return false;
         if (body.unwrap != expr_slot(expr).as.fun.body.unwrap) {
-            *expr1 = fun(param, body);
+            *expr1 = fun(expr_slot(expr).as.fun.param, body);
         } else {
             *expr1 = expr;
         }
@@ -912,9 +808,6 @@ typedef enum {
     TOKEN_NAME,
     TOKEN_INDEX,
     TOKEN_MAGIC,
-    TOKEN_OPEN,
-    TOKEN_IN,
-    TOKEN_SECTION,
 } Token_Kind;
 
 const char *token_kind_display(Token_Kind kind)
@@ -932,9 +825,6 @@ const char *token_kind_display(Token_Kind kind)
     case TOKEN_NAME:      return "TOKEN_NAME";
     case TOKEN_INDEX:     return "TOKEN_INDEX";
     case TOKEN_MAGIC:     return "TOKEN_MAGIC";
-    case TOKEN_OPEN:      return "`open`";
-    case TOKEN_IN:        return "`in`";
-    case TOKEN_SECTION:   return "`section`";
     default: UNREACHABLE("Token_Kind");
     }
 }
@@ -1038,32 +928,6 @@ size_t decode_utf8(const char *s, size_t n, uint32_t *cp)
     return len;
 }
 
-// Encodes one Unicode code point as UTF-8. `out` must have room for 4 bytes.
-// Returns the number of bytes written.
-size_t encode_utf8(uint32_t cp, unsigned char out[4])
-{
-    if (cp < 0x80) {
-        out[0] = (unsigned char) cp;
-        return 1;
-    }
-    if (cp < 0x800) {
-        out[0] = (unsigned char) (0xC0 | (cp >> 6));
-        out[1] = (unsigned char) (0x80 | (cp & 0x3F));
-        return 2;
-    }
-    if (cp < 0x10000) {
-        out[0] = (unsigned char) (0xE0 | (cp >> 12));
-        out[1] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
-        out[2] = (unsigned char) (0x80 | (cp & 0x3F));
-        return 3;
-    }
-    out[0] = (unsigned char) (0xF0 | (cp >> 18));
-    out[1] = (unsigned char) (0x80 | ((cp >> 12) & 0x3F));
-    out[2] = (unsigned char) (0x80 | ((cp >> 6) & 0x3F));
-    out[3] = (unsigned char) (0x80 | (cp & 0x3F));
-    return 4;
-}
-
 // Counts characters in a byte slice, treating every invalid byte as one
 // character. Used to report columns in characters rather than bytes.
 size_t count_chars(const char *s, size_t n)
@@ -1112,15 +976,13 @@ bool is_digit_cp(uint32_t cp)
 
 // Whether `cp` may appear in a name. ASCII letters and digits are always
 // accepted; non-ASCII letters and digits are accepted when the C library's
-// locale knows them (see init_name_locale()). `_`, `?`, `-`, `'`, and `/` are
-// always accepted, while `λ` is reserved for the lambda operator. `/` is the
-// namespace separator (`list/filter`); it cannot start a name, and `//` still
-// starts a comment.
+// locale knows them (see init_name_locale()). `_`, `?`, `-`, and `'` are
+// always accepted, while `λ` is reserved for the lambda operator.
 bool is_name_cp(uint32_t cp)
 {
     if (cp == 0x03BB) return false;
     if (cp < 0x80) {
-        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'' || cp == '/';
+        return is_ascii_alnum(cp) || cp == '_' || cp == '?' || cp == '-' || cp == '\'';
     }
     if (sizeof(wint_t) <= 2 && cp > 0xFFFF) return false;
     return iswalnum((wint_t) cp) != 0;
@@ -1129,12 +991,6 @@ bool is_name_cp(uint32_t cp)
 void lexer_read_name_chars(Lexer *l)
 {
     for (;;) {
-        // `//` starts a comment even when it follows name characters, so
-        // `foo//bar` is the name `foo` followed by a comment.
-        if (l->cur.pos + 1 < l->count &&
-            l->content[l->cur.pos] == '/' && l->content[l->cur.pos + 1] == '/') {
-            break;
-        }
         uint32_t cp = 0;
         size_t len = decode_utf8(l->content + l->cur.pos, l->count - l->cur.pos, &cp);
         if (len == 0 || !is_name_cp(cp)) break;
@@ -1263,10 +1119,7 @@ bool lexer_next(Lexer *l)
         return true;
     }
 
-    // `/` belongs to names only after the first character, so a leading slash
-    // is still an unknown token. This keeps `//` comments and raw file paths
-    // unambiguous.
-    if (is_name_cp(cp) && !is_digit_cp(cp) && cp != '/') {
+    if (is_name_cp(cp) && !is_digit_cp(cp)) {
         l->token = TOKEN_NAME;
         l->string.count = 0;
         for (size_t i = 0; i < len; ++i) {
@@ -1274,16 +1127,6 @@ bool lexer_next(Lexer *l)
         }
         lexer_read_name_chars(l);
         sb_append_null(&l->string);
-        // `open`, `in`, and `section` are reserved keywords. They are lexed
-        // after the whole name run is read, so qualified names such as
-        // `list/open` stay names.
-        if (strcmp(l->string.items, "open") == 0) {
-            l->token = TOKEN_OPEN;
-        } else if (strcmp(l->string.items, "in") == 0) {
-            l->token = TOKEN_IN;
-        } else if (strcmp(l->string.items, "section") == 0) {
-            l->token = TOKEN_SECTION;
-        }
         return true;
     }
 
@@ -1326,131 +1169,9 @@ bool lexer_expect(Lexer *l, Token_Kind expected)
     return true;
 }
 
-// `open`, `in`, and `section` are reserved, so they are never accepted where a
-// name is expected. Returns true (after reporting) when the current token is
-// one of them, letting callers fall back to their generic error otherwise.
-bool report_reserved_keyword(Lexer *l)
-{
-    const char *keyword = NULL;
-    switch (l->token) {
-    case TOKEN_OPEN:    keyword = "open";    break;
-    case TOKEN_IN:      keyword = "in";      break;
-    case TOKEN_SECTION: keyword = "section"; break;
-    default: return false;
-    }
-    lexer_print_loc(l, stderr);
-    fprintf(stderr, "ERROR: `%s` is a reserved keyword\n", keyword);
-    return true;
-}
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr);
 
-typedef struct {
-    const char *name;
-    Expr_Index body;
-} Binding;
-
-typedef struct {
-    Binding *items;
-    size_t count;
-    size_t capacity;
-} Bindings;
-
-// Namespaces opened with `open`. Opening is not a lexical scope: it only tells
-// the parser how to expand an unqualified name that is not a binding on its own.
-typedef struct {
-    const char **items;
-    size_t count;
-    size_t capacity;
-} Opens;
-
-typedef struct {
-    Bindings *bindings;
-    Opens *opens;
-    // The active `section`, or NULL for the empty section. Bindings defined
-    // while a section is active are prefixed with `section/`, and unqualified
-    // names in their bodies resolve into that section first.
-    const char *section;
-} Parse_Context;
-
-bool binding_exists(const Bindings *bindings, const char *name)
-{
-    for (size_t i = 0; i < bindings->count; ++i) {
-        if (bindings->items[i].name == name) return true;
-    }
-    return false;
-}
-
-// Expands `name` through the opened namespaces. A name that is defined either
-// bare or in exactly one opened namespace resolves to that binding; a qualified
-// name, or one that no opened namespace defines, stays as written. Returns
-// false when several bindings match, reporting the two conflicting names.
-bool resolve_open_name(Parse_Context *ctx, const char *name, const char **result, const char **conflict)
-{
-    if (strchr(name, '/') != NULL) {
-        *result = intern_label(name);
-        return true;
-    }
-
-    static String_Builder sb = {0};
-
-    // The active section is the innermost scope: a member of the section wins
-    // over a bare binding or an opened namespace of the same name.
-    if (ctx->section) {
-        sb.count = 0;
-        sb_appendf(&sb, "%s/%s", ctx->section, name);
-        sb_append_null(&sb);
-        const char *member = intern_label(sb.items);
-        if (binding_exists(ctx->bindings, member)) {
-            *result = member;
-            return true;
-        }
-    }
-
-    const char *found = NULL;
-    if (binding_exists(ctx->bindings, name)) found = intern_label(name);
-
-    for (size_t i = 0; i < ctx->opens->count; ++i) {
-        sb.count = 0;
-        sb_appendf(&sb, "%s/%s", ctx->opens->items[i], name);
-        sb_append_null(&sb);
-        const char *qualified = intern_label(sb.items);
-        if (!binding_exists(ctx->bindings, qualified)) continue;
-        if (found == NULL) {
-            found = qualified;
-        } else if (found != qualified) {
-            *result = found;
-            *conflict = qualified;
-            return false;
-        }
-    }
-
-    *result = found ? found : intern_label(name);
-    return true;
-}
-
-// A trailing `/` would make the qualified definition name end with `//`, which
-// the lexer would read back as the start of a comment.
-bool section_name_valid(const char *name)
-{
-    size_t len = strlen(name);
-    return len > 0 && name[len - 1] != '/';
-}
-
-// Prefixes a new binding name with the active section. A name that already
-// contains `/` is fully qualified and is kept as written; sections do not
-// nest, so nothing else needs to be resolved here.
-const char *qualify_name(const char *section, const char *name)
-{
-    if (section == NULL || strchr(name, '/') != NULL) return name;
-    static String_Builder sb = {0};
-    sb.count = 0;
-    sb_appendf(&sb, "%s/%s", section, name);
-    sb_append_null(&sb);
-    return intern_label(sb.items);
-}
-
-bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr);
-
-bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
+bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
     const char *param = NULL;
     if (!lexer_next(l)) return false;
@@ -1461,16 +1182,13 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Ind
         param = intern_label(l->string.items);
         if (!lexer_expect(l, TOKEN_DOT)) return false;
     } else {
-        if (report_reserved_keyword(l)) return false;
         lexer_print_loc(l, stderr);
         fprintf(stderr, "ERROR: Unexpected token %s. Expected a parameter name or `.` instead.\n",
                 token_kind_display(l->token));
         return false;
     }
 
-    // NOTE: `\x.y.body` means `\x.\y.body`, and `\..body` means `\.\.body`.
-    // A `.` cannot start an expression, so treating it as another anonymous
-    // binder is unambiguous.
+    // NOTE: `\x.y.body` means `\x.\y.body`
     bool shorthand = false;
     {
         Cur cur = l->cur;
@@ -1478,8 +1196,6 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Ind
         if (l->token == TOKEN_NAME) {
             if (!lexer_next(l)) return false;
             shorthand = l->token == TOKEN_DOT;
-        } else if (l->token == TOKEN_DOT) {
-            shorthand = true;
         }
         l->cur = cur;
     }
@@ -1487,8 +1203,8 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Ind
     da_append(scope, param);
     Expr_Index body;
     bool ok = shorthand
-        ? parse_fun_scope(l, scope, ctx, &body)
-        : parse_expr_scope(l, scope, ctx, &body);
+        ? parse_fun_scope(l, scope, &body)
+        : parse_expr_scope(l, scope, &body);
     scope->count -= 1;
     if (!ok) return false;
 
@@ -1496,16 +1212,16 @@ bool parse_fun_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Ind
     return true;
 }
 
-bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
+bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
     if (!lexer_next(l)) return false;
     switch (l->token) {
     case TOKEN_OPAREN: {
-        if (!parse_expr_scope(l, scope, ctx, expr)) return false;
+        if (!parse_expr_scope(l, scope, expr)) return false;
         if (!lexer_expect(l, TOKEN_CPAREN)) return false;
         return true;
     }
-    case TOKEN_LAMBDA: return parse_fun_scope(l, scope, ctx, expr);
+    case TOKEN_LAMBDA: return parse_fun_scope(l, scope, expr);
     case TOKEN_MAGIC:
         *expr = magic(l->string.items);
         return true;
@@ -1519,80 +1235,26 @@ bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr
         return true;
     }
     case TOKEN_NAME: {
-        const char *name = intern_label(l->string.items);
-
+        const char *label = intern_label(l->string.items);
         for (size_t i = scope->count; i > 0; --i) {
-            if (scope->items[i - 1] == name) {
+            if (scope->items[i - 1] == label) {
                 *expr = bound_var(scope->count - i);
                 return true;
             }
         }
-        const char *resolved = NULL;
-        const char *conflict = NULL;
-        if (!resolve_open_name(ctx, name, &resolved, &conflict)) {
-            lexer_print_loc(l, stderr);
-            fprintf(stderr, "ERROR: Name `%s` is ambiguous between `%s` and `%s`\n",
-                    name, resolved, conflict);
-            return false;
-        }
-        *expr = free_var(resolved);
-        return true;
-    }
-    case TOKEN_OPEN: {
-        // `open ns ... in expr` scopes the named namespaces to `expr`. `open`
-        // is reserved, so there is no fallback to an ordinary variable name.
-        size_t base = ctx->opens->count;
-        bool saw_in = false;
-
-        for (;;) {
-            if (!lexer_next(l)) {
-                ctx->opens->count = base;
-                return false;
-            }
-            if (l->token == TOKEN_IN) {
-                saw_in = true;
-                break;
-            }
-            if (l->token != TOKEN_NAME) break;
-            da_append(ctx->opens, intern_label(l->string.items));
-        }
-
-        if (!saw_in) {
-            lexer_print_loc(l, stderr);
-            if (ctx->opens->count == base) {
-                fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
-            } else {
-                fprintf(stderr, "ERROR: Expected `in` after the namespaces of `open`\n");
-            }
-            ctx->opens->count = base;
-            return false;
-        }
-
-        if (ctx->opens->count == base) {
-            lexer_print_loc(l, stderr);
-            fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
-            ctx->opens->count = base;
-            return false;
-        }
-
-        Expr_Index body;
-        bool ok = parse_expr_scope(l, scope, ctx, &body);
-        ctx->opens->count = base;
-        if (!ok) return false;
-        *expr = body;
+        *expr = free_var(label);
         return true;
     }
     default:
-        if (report_reserved_keyword(l)) return false;
         lexer_print_loc(l, stderr);
         fprintf(stderr, "ERROR: Unexpected token %s. Expected a primary expression instead.\n", token_kind_display(l->token));
         return false;
     }
 }
 
-bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr)
+bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Expr_Index *expr)
 {
-    if (!parse_primary_scope(l, scope, ctx, expr)) return false;
+    if (!parse_primary_scope(l, scope, expr)) return false;
 
     if (!lexer_peek(l)) return false;
     while (
@@ -1601,21 +1263,21 @@ bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_In
         l->token != TOKEN_SEMICOLON
     ) {
         Expr_Index rhs;
-        if (!parse_primary_scope(l, scope, ctx, &rhs)) return false;
+        if (!parse_primary_scope(l, scope, &rhs)) return false;
         *expr = app(*expr, rhs);
         if (!lexer_peek(l)) return false;
     }
     return true;
 }
 
-bool parse_expr(Lexer *l, Parse_Context *ctx, Expr_Index *expr)
+bool parse_expr(Lexer *l, Expr_Index *expr)
 {
     static Binder_Stack scope = {0};
     scope.count = 0;
-    return parse_expr_scope(l, &scope, ctx, expr);
+    return parse_expr_scope(l, &scope, expr);
 }
 
-bool parse_binding_body(Lexer *l, Parse_Context *ctx, Expr_Index *body)
+bool parse_binding_body(Lexer *l, Expr_Index *body)
 {
     // NOTE: the parameters of a binding are just syntactic sugar for nested lambdas.
     // `f x y = body;` is equivalent to `f = \x.y.body;`
@@ -1629,12 +1291,11 @@ bool parse_binding_body(Lexer *l, Parse_Context *ctx, Expr_Index *body)
     }
 
     if (l->token != TOKEN_EQUALS) {
-        if (report_reserved_keyword(l)) return false;
         report_unexpected(l, TOKEN_EQUALS);
         return false;
     }
 
-    if (!parse_expr_scope(l, &scope, ctx, body)) return false;
+    if (!parse_expr_scope(l, &scope, body)) return false;
 
     for (size_t i = scope.count; i > 0; --i) {
         *body = fun(scope.items[i - 1], *body);
@@ -1649,51 +1310,45 @@ typedef struct {
     const char *description;
 } Command;
 
-// Single source of truth for the commands shown by `:help` and for the REPL's
-// Tab completion. The extension mirrors this list.
-static const Command COMMANDS[] = {
-    {"load",      "[path]",        "Load/reload bindings from a file."},
-    {"save",      "[path]",        "Save current bindings to a file."},
-    {"edit",      "[path]",        "Edit current active file. Reload it on exit."},
-    {"list",      "[names...]",    "list the bindings"},
-    {"delete",    "<name>",        "delete a binding by name"},
-    {"debug",     "<expr>",        "Step debug the evaluation of an expression"},
-    {"set",       "<key> <value>",  "Set a setting: `debruijn` controls variable output, `unicode` prints λ, `shorthand` elides chained lambdas."},
-    {"ast",       "<expr>",        "print the AST of the expression"},
-    {"quit",      "",              "quit the REPL"},
-    {"help",      "",              "print this help message"},
-};
-#define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
+typedef struct {
+    Command *items;
+    size_t count;
+    size_t capacity;
+} Commands;
 
-bool command(const char *input, const char *name)
+bool command(Commands *commands, const char *input, const char *name, const char *signature, const char *description)
 {
-    return strcmp(input, name) == 0;
-}
-
-const Command *find_command(const char *name)
-{
-    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
-        if (strcmp(COMMANDS[i].name, name) == 0) return &COMMANDS[i];
+    Command command = {
+        .name        = name,
+        .signature   = signature,
+        .description = description,
+    };
+    da_append(commands, command);
+    while (*input && *name && *input == *name) {
+        input++;
+        name++;
     }
-    return NULL;
+    return *input == '\0';
 }
 
-void print_available_commands(void)
+void print_available_commands(Commands *commands)
 {
     printf("Available commands:\n");
-    size_t max_name_width = 0;
-    size_t max_sig_width = 0;
-    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
-        size_t name_width = strlen(COMMANDS[i].name);
-        size_t sig_width  = strlen(COMMANDS[i].signature);
+    int max_name_width = 0;
+    int max_sig_width = 0;
+    for (size_t i = 0; i < commands->count; ++i) {
+        Command command = commands->items[i];
+        int name_width  = strlen(command.name);
+        int sig_width   = strlen(command.signature);
         if (name_width > max_name_width) max_name_width = name_width;
         if (sig_width  > max_sig_width)  max_sig_width  = sig_width;
     }
-    for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
+    for (size_t i = 0; i < commands->count; ++i) {
+        Command command = commands->items[i];
         printf("  :%-*s %-*s - %s\n",
-               (int) max_name_width, COMMANDS[i].name,
-               (int) max_sig_width,  COMMANDS[i].signature,
-               COMMANDS[i].description);
+               max_name_width, command.name,
+               max_sig_width,  command.signature,
+               command.description);
     }
 }
 
@@ -1718,6 +1373,17 @@ void gc_mark(Expr_Index root)
     }
 }
 
+typedef struct {
+    const char *name;
+    Expr_Index body;
+} Binding;
+
+typedef struct {
+    Binding *items;
+    size_t count;
+    size_t capacity;
+} Bindings;
+
 void create_binding(Bindings *bindings, const char *name, Expr_Index body)
 {
     for (size_t i = 0; i < bindings->count; ++i) {
@@ -1739,12 +1405,6 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
 {
     static String_Builder sb = {0};
     static Lexer l = {0};
-    static Opens opens = {0};
-
-    // `open` in a binding file is scoped to that file. Loading a file does not
-    // change the namespaces the REPL itself has open.
-    opens.count = 0;
-    Parse_Context ctx = {bindings, &opens, NULL};
 
     sb.count = 0;
     if (!read_entire_file(file_path, &sb)) return false;
@@ -1753,71 +1413,12 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
 
     if (!lexer_peek(&l)) return false;
     while (l.token != TOKEN_END) {
-        if (l.token == TOKEN_OPEN) {
-            if (!lexer_expect(&l, TOKEN_OPEN)) return false;
-            if (!lexer_next(&l)) return false;
-
-            size_t base = opens.count;
-            while (l.token == TOKEN_NAME) {
-                da_append(&opens, intern_label(l.string.items));
-                if (!lexer_next(&l)) return false;
-            }
-
-            if (opens.count == base) {
-                lexer_print_loc(&l, stderr);
-                fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
-                return false;
-            }
-            if (l.token == TOKEN_IN) {
-                lexer_print_loc(&l, stderr);
-                fprintf(stderr, "ERROR: `open ... in ...` is an expression, not a binding-file statement\n");
-                return false;
-            }
-            if (l.token != TOKEN_SEMICOLON) {
-                report_unexpected(&l, TOKEN_SEMICOLON);
-                return false;
-            }
-            if (!lexer_peek(&l)) return false;
-            continue;
-        }
-
-        // `section name;` prefixes the following definitions with `name/` and
-        // lets them refer to each other unqualified. A bare `section;` returns
-        // to the empty section. Sections do not nest: `section` replaces the
-        // current one.
-        if (l.token == TOKEN_SECTION) {
-            if (!lexer_expect(&l, TOKEN_SECTION)) return false;
-            if (!lexer_next(&l)) return false;
-            if (l.token == TOKEN_NAME) {
-                const char *section = intern_label(l.string.items);
-                if (!section_name_valid(section)) {
-                    lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: A section name cannot end with `/`\n");
-                    return false;
-                }
-                ctx.section = section;
-                if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
-            } else if (l.token == TOKEN_SEMICOLON) {
-                ctx.section = NULL;
-            } else {
-                lexer_print_loc(&l, stderr);
-                fprintf(stderr, "ERROR: Expected a section name or `;` after `section`\n");
-                return false;
-            }
-            if (!lexer_peek(&l)) return false;
-            continue;
-        }
-
-        if (l.token == TOKEN_IN) {
-            report_reserved_keyword(&l);
-            return false;
-        }
         if (!lexer_expect(&l, TOKEN_NAME)) return false;
         const char *name = intern_label(l.string.items);
         Expr_Index body;
-        if (!parse_binding_body(&l, &ctx, &body)) return false;
+        if (!parse_binding_body(&l, &body)) return false;
         if (!lexer_expect(&l, TOKEN_SEMICOLON)) return false;
-        create_binding(bindings, qualify_name(ctx.section, name), body);
+        create_binding(bindings, name, body);
         if (!lexer_peek(&l)) return false;
     }
     return true;
@@ -1855,793 +1456,6 @@ void ctrl_c_handler(int signum)
     ctrl_c = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Line editing and Tab completion for the REPL.
-//
-// The REPL reads keys itself so that Tab can complete commands and binding
-// names. Completion follows the command signatures in COMMANDS: `:help `
-// has no arguments, `:set debruijn ` offers modes, `:delete ` and `:list `
-// offer names, `:ast ` and `:debug ` offer expression atoms, and path
-// arguments (`:load`, `:save`, `:edit`) are left alone.
-// ---------------------------------------------------------------------------
-
-typedef enum {
-    ARG_NONE,
-    ARG_MODE,
-    ARG_NAME,
-    ARG_NAMES,
-    ARG_EXPR,
-    ARG_SET,
-} Arg_Kind;
-
-Arg_Kind command_arg_kind(const char *signature)
-{
-    if (strcmp(signature, "[on|off|full]") == 0)            return ARG_MODE;
-    if (strcmp(signature, "<key> <value>") == 0)            return ARG_SET;
-    if (strcmp(signature, "<name>") == 0)                   return ARG_NAME;
-    if (strcmp(signature, "[names...]") == 0)               return ARG_NAMES;
-    if (strcmp(signature, "<expr>") == 0)                   return ARG_EXPR;
-    return ARG_NONE;
-}
-
-typedef struct {
-    char *data;
-    size_t size;
-    size_t count;
-    size_t cursor;
-} Input_Line;
-
-typedef enum {
-    INPUT_OK,
-    INPUT_EOF,
-    INPUT_ERROR,
-} Input_Status;
-
-size_t prev_codepoint(const char *s, size_t pos)
-{
-    if (pos == 0) return 0;
-    --pos;
-    while (pos > 0 && ((unsigned char) s[pos] & 0xC0) == 0x80) --pos;
-    return pos;
-}
-
-size_t next_codepoint(const char *s, size_t count, size_t pos)
-{
-    if (pos >= count) return count;
-    ++pos;
-    while (pos < count && ((unsigned char) s[pos] & 0xC0) == 0x80) ++pos;
-    return pos;
-}
-
-void line_set(Input_Line *line, const char *text)
-{
-    size_t n = strlen(text);
-    if (n >= line->size) n = line->size - 1;
-    memcpy(line->data, text, n);
-    line->data[n] = '\0';
-    line->count = n;
-    line->cursor = n;
-}
-
-bool line_insert(Input_Line *line, const char *bytes, size_t n)
-{
-    if (line->count + n >= line->size) return false;
-    memmove(line->data + line->cursor + n,
-            line->data + line->cursor,
-            line->count - line->cursor);
-    memcpy(line->data + line->cursor, bytes, n);
-    line->count += n;
-    line->cursor += n;
-    line->data[line->count] = '\0';
-    return true;
-}
-
-void line_delete(Input_Line *line, size_t from, size_t to)
-{
-    if (to > line->count) to = line->count;
-    if (from >= to) return;
-    memmove(line->data + from, line->data + to, line->count - to);
-    line->count -= to - from;
-    if (line->cursor > to) {
-        line->cursor -= to - from;
-    } else if (line->cursor > from) {
-        line->cursor = from;
-    }
-    line->data[line->count] = '\0';
-}
-
-// Repaints the prompt and the line, then moves the terminal cursor back to
-// `line->cursor`. Only `\r` and `\b` are used for positioning so the editor
-// works in a plain Windows console as well as in ANSI terminals.
-void line_render(const char *prompt, const Input_Line *line, size_t *rendered_columns)
-{
-    size_t prompt_width = count_chars(prompt, strlen(prompt));
-    size_t columns = prompt_width + count_chars(line->data, line->count);
-    size_t cursor_columns = prompt_width + count_chars(line->data, line->cursor);
-
-    putchar('\r');
-    fputs(prompt, stdout);
-    if (line->count > 0) fwrite(line->data, 1, line->count, stdout);
-
-    for (size_t i = columns; i < *rendered_columns; ++i) putchar(' ');
-    for (size_t i = columns; i < *rendered_columns; ++i) putchar('\b');
-    for (size_t i = cursor_columns; i < columns; ++i) putchar('\b');
-
-    fflush(stdout);
-    *rendered_columns = columns;
-}
-
-typedef struct {
-    char **items;
-    size_t count;
-    size_t capacity;
-} History;
-
-static History history = {0};
-
-void history_add(const char *text)
-{
-    if (*text == '\0') return;
-    if (history.count > 0 && strcmp(history.items[history.count - 1], text) == 0) return;
-    da_append(&history, copy_string(text));
-    if (history.count > 100) {
-        free(history.items[0]);
-        da_delete_at(&history, 0);
-    }
-}
-
-bool stdin_is_interactive(void)
-{
-#ifdef _WIN32
-    // A pipe (for example under mintty) is not a console: `_getwch` cannot
-    // read it, so leave that case to `fgets`.
-    DWORD mode = 0;
-    return GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) != 0;
-#else
-    return isatty(STDIN_FILENO) != 0;
-#endif
-}
-
-#ifndef _WIN32
-static struct termios saved_termios;
-static bool termios_saved = false;
-
-bool terminal_enter_raw(void)
-{
-    if (tcgetattr(STDIN_FILENO, &saved_termios) < 0) return false;
-    struct termios raw = saved_termios;
-    raw.c_lflag &= ~(ICANON | ECHO);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) return false;
-    termios_saved = true;
-    return true;
-}
-
-void terminal_leave_raw(void)
-{
-    if (termios_saved) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
-        termios_saved = false;
-    }
-}
-#else
-static DWORD saved_console_mode = 0;
-static bool console_mode_saved = false;
-
-bool terminal_enter_raw(void)
-{
-    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
-    if (!GetConsoleMode(input, &saved_console_mode)) return false;
-    // Disable processed input so Ctrl+C arrives as a key press instead of
-    // terminating the process: `_getwch` then returns 3.
-    DWORD mode = saved_console_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-    if (!SetConsoleMode(input, mode)) return false;
-    console_mode_saved = true;
-    return true;
-}
-
-void terminal_leave_raw(void)
-{
-    if (console_mode_saved) {
-        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved_console_mode);
-        console_mode_saved = false;
-    }
-}
-#endif // _WIN32
-
-typedef enum {
-    KEY_CHAR,
-    KEY_ENTER,
-    KEY_BACKSPACE,
-    KEY_DELETE,
-    KEY_LEFT,
-    KEY_RIGHT,
-    KEY_UP,
-    KEY_DOWN,
-    KEY_HOME,
-    KEY_END,
-    KEY_TAB,
-    KEY_CTRL_C,
-    KEY_CTRL_D,
-    KEY_CTRL_U,
-    KEY_EOF,
-    KEY_UNKNOWN,
-} Key_Kind;
-
-typedef struct {
-    Key_Kind kind;
-    unsigned char bytes[8];
-    size_t byte_count;
-} Key;
-
-#ifdef _WIN32
-Key input_read_key(void)
-{
-    Key key = {0};
-    // `_getwch` reads UTF-16 code units, which keeps non-ASCII names intact.
-    wint_t c = _getwch();
-    if (c == WEOF) {
-        key.kind = KEY_EOF;
-        return key;
-    }
-    if (c == 0 || c == 224) {
-        wint_t code = _getwch();
-        switch (code) {
-        case 72: key.kind = KEY_UP;       break;
-        case 80: key.kind = KEY_DOWN;     break;
-        case 75: key.kind = KEY_LEFT;     break;
-        case 77: key.kind = KEY_RIGHT;    break;
-        case 71: key.kind = KEY_HOME;     break;
-        case 79: key.kind = KEY_END;      break;
-        case 83: key.kind = KEY_DELETE;   break;
-        default: key.kind = KEY_UNKNOWN;  break;
-        }
-        return key;
-    }
-    switch (c) {
-    case '\r':
-    case '\n': key.kind = KEY_ENTER;     break;
-    case 8:
-    case 127:  key.kind = KEY_BACKSPACE; break;
-    case '\t': key.kind = KEY_TAB;       break;
-    case 3:    key.kind = KEY_CTRL_C;    break;
-    case 4:    key.kind = KEY_CTRL_D;    break;
-    case 21:   key.kind = KEY_CTRL_U;    break;
-    case 26:   key.kind = KEY_EOF;       break;
-    default:
-        if (c >= 32) {
-            uint32_t cp = (uint32_t) c;
-            if (c >= 0xD800 && c <= 0xDBFF) {
-                wint_t low = _getwch();
-                if (low >= 0xDC00 && low <= 0xDFFF) {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + ((uint32_t) low - 0xDC00);
-                } else {
-                    cp = 0xFFFD;
-                }
-            }
-            key.kind = KEY_CHAR;
-            key.byte_count = encode_utf8(cp, key.bytes);
-        } else {
-            key.kind = KEY_UNKNOWN;
-        }
-        break;
-    }
-    return key;
-}
-#else
-typedef enum {
-    BYTE_OK,
-    BYTE_EOF,
-    BYTE_INTERRUPTED,
-} Byte_Status;
-
-Byte_Status input_read_byte(unsigned char *byte)
-{
-    for (;;) {
-        ssize_t n = read(STDIN_FILENO, byte, 1);
-        if (n == 1) return BYTE_OK;
-        if (n < 0 && errno == EINTR) {
-            if (ctrl_c) {
-                ctrl_c = 0;
-                return BYTE_INTERRUPTED;
-            }
-            continue;
-        }
-        return BYTE_EOF;
-    }
-}
-
-bool input_wait_readable(int milliseconds)
-{
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(STDIN_FILENO, &set);
-    struct timeval timeout = {
-        .tv_sec = milliseconds / 1000,
-        .tv_usec = (milliseconds % 1000) * 1000,
-    };
-    return select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) > 0;
-}
-
-Key input_read_key(void)
-{
-    Key key = {0};
-    // A signal may have interrupted a helper like select() during an escape
-    // sequence instead of the main read().
-    if (ctrl_c) {
-        ctrl_c = 0;
-        key.kind = KEY_CTRL_C;
-        return key;
-    }
-    unsigned char c = 0;
-    Byte_Status status = input_read_byte(&c);
-    if (status == BYTE_INTERRUPTED) {
-        key.kind = KEY_CTRL_C;
-        return key;
-    }
-    if (status == BYTE_EOF) {
-        key.kind = KEY_EOF;
-        return key;
-    }
-
-    if (c == 27) {
-        // Escape sequence: arrows, Home, End, Delete.
-        if (!input_wait_readable(30)) {
-            key.kind = KEY_UNKNOWN;
-            return key;
-        }
-        unsigned char seq[8] = {0};
-        size_t n = 0;
-        for (;;) {
-            unsigned char b = 0;
-            if (input_read_byte(&b) != BYTE_OK) break;
-            if (n < sizeof(seq)) seq[n++] = b;
-            if (b != '[' && b != 'O' && !(b >= '0' && b <= '9') && b != ';') break;
-            if (n >= 2 && b >= 'A' && b <= 'Z') break;
-            if (!input_wait_readable(10)) break;
-        }
-        if (n == 0) {
-            key.kind = KEY_UNKNOWN;
-            return key;
-        }
-        switch (seq[n - 1]) {
-        case 'A': key.kind = KEY_UP;       break;
-        case 'B': key.kind = KEY_DOWN;     break;
-        case 'C': key.kind = KEY_RIGHT;    break;
-        case 'D': key.kind = KEY_LEFT;     break;
-        case 'H': key.kind = KEY_HOME;     break;
-        case 'F': key.kind = KEY_END;      break;
-        case '~':
-            if (n >= 2 && seq[n - 2] == '3')      key.kind = KEY_DELETE;
-            else if (n >= 2 && seq[n - 2] == '1') key.kind = KEY_HOME;
-            else if (n >= 2 && seq[n - 2] == '4') key.kind = KEY_END;
-            else                                  key.kind = KEY_UNKNOWN;
-            break;
-        default: key.kind = KEY_UNKNOWN; break;
-        }
-        return key;
-    }
-
-    switch (c) {
-    case '\r':
-    case '\n': key.kind = KEY_ENTER;     break;
-    case 8:
-    case 127:  key.kind = KEY_BACKSPACE; break;
-    case '\t': key.kind = KEY_TAB;       break;
-    case 3:    key.kind = KEY_CTRL_C;    break;
-    case 4:    key.kind = KEY_CTRL_D;    break;
-    case 21:   key.kind = KEY_CTRL_U;    break;
-    default:
-        if (c >= 32) {
-            key.kind = KEY_CHAR;
-            key.bytes[0] = c;
-            key.byte_count = 1;
-        } else {
-            key.kind = KEY_UNKNOWN;
-        }
-        break;
-    }
-    return key;
-}
-#endif // _WIN32
-
-bool is_completion_name_byte(unsigned char c)
-{
-    return is_ascii_alnum(c) || c == '_' || c == '?' || c == '-' || c == '\'' || c == '/' || c >= 0x80;
-}
-
-size_t completion_word_start(const Input_Line *line)
-{
-    size_t start = line->cursor;
-    while (start > 0 && is_completion_name_byte((unsigned char) line->data[start - 1])) {
-        --start;
-    }
-    if (start > 0 && (line->data[start - 1] == ':' || line->data[start - 1] == '#')) {
-        --start;
-    }
-    return start;
-}
-
-typedef struct {
-    char **items;
-    size_t count;
-    size_t capacity;
-} Candidates;
-
-void candidates_add(Candidates *list, const char *text)
-{
-    for (size_t i = 0; i < list->count; ++i) {
-        if (strcmp(list->items[i], text) == 0) return;
-    }
-    da_append(list, copy_string(text));
-}
-
-void candidates_free(Candidates *list)
-{
-    for (size_t i = 0; i < list->count; ++i) free(list->items[i]);
-    free(list->items);
-    memset(list, 0, sizeof(*list));
-}
-
-int candidate_cmp(const void *a, const void *b)
-{
-    return strcmp(*(const char *const *) a, *(const char *const *) b);
-}
-
-void candidates_add_bindings(Candidates *out, const Bindings *bindings,
-                             const char *prefix, size_t prefix_len)
-{
-    for (size_t i = 0; i < bindings->count; ++i) {
-        const char *name = bindings->items[i].name;
-        if (prefix_len == 0 || strncmp(name, prefix, prefix_len) == 0) {
-            candidates_add(out, name);
-        }
-    }
-}
-
-static const char *const REPL_MAGICS[] = {"#trace", "#void"};
-
-void candidates_add_magics(Candidates *out, const char *prefix, size_t prefix_len)
-{
-    for (size_t i = 0; i < sizeof(REPL_MAGICS) / sizeof(REPL_MAGICS[0]); ++i) {
-        if (prefix_len == 0 || strncmp(REPL_MAGICS[i], prefix, prefix_len) == 0) {
-            candidates_add(out, REPL_MAGICS[i]);
-        }
-    }
-}
-
-void candidates_add_modes(Candidates *out, const char *prefix, size_t prefix_len,
-                          bool include_full)
-{
-    static const char *const modes[] = {"off", "on", "full"};
-    size_t count = include_full ? 3 : 2;
-    for (size_t i = 0; i < count; ++i) {
-        if (prefix_len == 0 || strncmp(modes[i], prefix, prefix_len) == 0) {
-            candidates_add(out, modes[i]);
-        }
-    }
-}
-
-typedef struct {
-    bool in_args;
-    Arg_Kind kind;
-    size_t args_start;
-    size_t completed;
-} Command_Context;
-
-Command_Context completion_command_context(const Input_Line *line, size_t word_start)
-{
-    Command_Context ctx = {0};
-    size_t i = 0;
-    while (i < word_start && is_ascii_space((unsigned char) line->data[i])) ++i;
-    if (i >= word_start || line->data[i] != ':') return ctx;
-
-    size_t name_start = i + 1;
-    size_t name_end = name_start;
-    while (name_end < line->cursor &&
-           is_completion_name_byte((unsigned char) line->data[name_end])) {
-        ++name_end;
-    }
-    if (name_end == name_start) return ctx;
-    // The cursor is still inside the command name.
-    if (name_end >= line->cursor) return ctx;
-    if (!is_ascii_space((unsigned char) line->data[name_end])) return ctx;
-
-    char name[64];
-    size_t name_len = name_end - name_start;
-    if (name_len >= sizeof(name)) return ctx;
-    memcpy(name, line->data + name_start, name_len);
-    name[name_len] = '\0';
-
-    ctx.in_args = true;
-    const Command *command = find_command(name);
-    ctx.kind = command ? command_arg_kind(command->signature) : ARG_NONE;
-
-    size_t j = name_end;
-    while (j < word_start && is_ascii_space((unsigned char) line->data[j])) ++j;
-    ctx.args_start = j;
-    while (j < word_start) {
-        while (j < word_start && is_ascii_space((unsigned char) line->data[j])) ++j;
-        if (j < word_start) {
-            ctx.completed++;
-            while (j < word_start && !is_ascii_space((unsigned char) line->data[j])) ++j;
-        }
-    }
-    return ctx;
-}
-
-bool completion_arg_equals(const Input_Line *line, const Command_Context *ctx, const char *text)
-{
-    size_t len = strlen(text);
-    if (ctx->args_start + len > line->cursor) return false;
-    if (strncmp(line->data + ctx->args_start, text, len) != 0) return false;
-    return ctx->args_start + len == line->cursor ||
-        is_ascii_space((unsigned char) line->data[ctx->args_start + len]);
-}
-
-void completion_candidates(const Input_Line *line, size_t word_start,
-                           const Bindings *bindings, Candidates *out)
-{
-    const char *prefix = line->data + word_start;
-    size_t prefix_len = line->cursor - word_start;
-    Command_Context ctx = completion_command_context(line, word_start);
-
-    if (ctx.in_args) {
-        if (ctx.kind == ARG_NONE) return;
-
-        if (ctx.kind == ARG_SET) {
-            if (ctx.completed == 0) {
-                static const char *const settings[] = {"debruijn", "unicode", "shorthand"};
-                for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); ++i) {
-                    if (prefix_len == 0 || strncmp(settings[i], prefix, prefix_len) == 0) {
-                        candidates_add(out, settings[i]);
-                    }
-                }
-                return;
-            }
-            if (ctx.completed > 1) return;
-            if (completion_arg_equals(line, &ctx, "unicode") ||
-                completion_arg_equals(line, &ctx, "shorthand")) {
-                candidates_add_modes(out, prefix, prefix_len, false);
-                return;
-            }
-            if (!completion_arg_equals(line, &ctx, "debruijn")) return;
-        } else if ((ctx.kind == ARG_MODE || ctx.kind == ARG_NAME) && ctx.completed > 0) {
-            return;
-        }
-
-        if (ctx.kind == ARG_MODE || ctx.kind == ARG_SET) {
-            candidates_add_modes(out, prefix, prefix_len, true);
-            return;
-        }
-        if (ctx.kind == ARG_EXPR && prefix_len > 0 && prefix[0] == '#') {
-            candidates_add_magics(out, prefix, prefix_len);
-            return;
-        }
-        candidates_add_bindings(out, bindings, prefix, prefix_len);
-        return;
-    }
-
-    // Not a command argument. Require a typed prefix so plain Tab in an empty
-    // line does not dump every binding.
-    if (prefix_len == 0) return;
-
-    if (prefix[0] == ':') {
-        for (size_t i = 0; i < COMMANDS_COUNT; ++i) {
-            char text[64];
-            snprintf(text, sizeof(text), ":%s", COMMANDS[i].name);
-            if (strncmp(text, prefix, prefix_len) == 0) {
-                candidates_add(out, text);
-            }
-        }
-    } else if (prefix[0] == '#') {
-        candidates_add_magics(out, prefix, prefix_len);
-    } else {
-        candidates_add_bindings(out, bindings, prefix, prefix_len);
-    }
-}
-
-void complete_line(const char *prompt, Input_Line *line, const Bindings *bindings,
-                   size_t *rendered_columns)
-{
-    size_t word_start = completion_word_start(line);
-    Candidates candidates = {0};
-    completion_candidates(line, word_start, bindings, &candidates);
-
-    if (candidates.count == 0) {
-        putchar('\a');
-        fflush(stdout);
-        candidates_free(&candidates);
-        return;
-    }
-
-    qsort(candidates.items, candidates.count, sizeof(candidates.items[0]), candidate_cmp);
-
-    const char *prefix = line->data + word_start;
-    size_t prefix_len = line->cursor - word_start;
-
-    size_t common = strlen(candidates.items[0]);
-    for (size_t i = 1; i < candidates.count; ++i) {
-        size_t j = 0;
-        while (j < common && candidates.items[i][j] && candidates.items[0][j] == candidates.items[i][j]) {
-            ++j;
-        }
-        common = j;
-    }
-    if (common < prefix_len) common = prefix_len;
-
-    bool completing_command = prefix_len > 0 && prefix[0] == ':';
-    if (candidates.count == 1 || common > prefix_len) {
-        size_t replacement_len = candidates.count == 1
-            ? strlen(candidates.items[0])
-            : common;
-        line_delete(line, word_start, line->cursor);
-        line_insert(line, candidates.items[0], replacement_len);
-        if (candidates.count == 1 && completing_command) {
-            bool has_space = line->cursor < line->count &&
-                is_ascii_space((unsigned char) line->data[line->cursor]);
-            if (!has_space) line_insert(line, " ", 1);
-        }
-        line_render(prompt, line, rendered_columns);
-    } else {
-        // Ambiguous and no progress: list the candidates and redraw the line.
-        size_t max_width = 0;
-        for (size_t i = 0; i < candidates.count; ++i) {
-            size_t width = strlen(candidates.items[i]);
-            if (width > max_width) max_width = width;
-        }
-        size_t per_line = max_width > 16 ? 1 : 4;
-        printf("\r\n");
-        for (size_t i = 0; i < candidates.count; ++i) {
-            printf("  %-*s", (int) max_width, candidates.items[i]);
-            if ((i + 1) % per_line == 0 || i + 1 == candidates.count) printf("\n");
-        }
-        *rendered_columns = 0;
-        line_render(prompt, line, rendered_columns);
-    }
-
-    candidates_free(&candidates);
-}
-
-Input_Status input_read_line(const char *prompt, Bindings *bindings, char *buffer, size_t size)
-{
-    if (!stdin_is_interactive()) {
-        fputs(prompt, stdout);
-        fflush(stdout);
-        if (!fgets(buffer, (int) size, stdin)) {
-            return feof(stdin) ? INPUT_EOF : INPUT_ERROR;
-        }
-        size_t n = strlen(buffer);
-        while (n > 0 && (buffer[n - 1] == '\n' || buffer[n - 1] == '\r')) {
-            buffer[--n] = '\0';
-        }
-        return INPUT_OK;
-    }
-
-#ifndef _WIN32
-    ctrl_c = 0;
-#endif
-
-    Input_Line line = {
-        .data = buffer,
-        .size = size,
-    };
-    line_set(&line, "");
-
-    size_t rendered_columns = 0;
-    line_render(prompt, &line, &rendered_columns);
-
-    bool raw = terminal_enter_raw();
-    Input_Status status = INPUT_OK;
-    size_t history_index = 0;
-    char *draft = NULL;
-
-    for (;;) {
-        Key key = input_read_key();
-        switch (key.kind) {
-        case KEY_CHAR:
-            if (!line_insert(&line, (const char *) key.bytes, key.byte_count)) {
-                putchar('\a');
-            }
-            line_render(prompt, &line, &rendered_columns);
-            break;
-        case KEY_ENTER:
-            printf("\r\n");
-            history_add(line.data);
-            goto done;
-        case KEY_BACKSPACE:
-            if (line.cursor > 0) {
-                size_t from = prev_codepoint(line.data, line.cursor);
-                line_delete(&line, from, line.cursor);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_DELETE:
-            if (line.cursor < line.count) {
-                size_t to = next_codepoint(line.data, line.count, line.cursor);
-                line_delete(&line, line.cursor, to);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_LEFT:
-            if (line.cursor > 0) {
-                line.cursor = prev_codepoint(line.data, line.cursor);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_RIGHT:
-            if (line.cursor < line.count) {
-                line.cursor = next_codepoint(line.data, line.count, line.cursor);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_HOME:
-            line.cursor = 0;
-            line_render(prompt, &line, &rendered_columns);
-            break;
-        case KEY_END:
-            line.cursor = line.count;
-            line_render(prompt, &line, &rendered_columns);
-            break;
-        case KEY_UP:
-            if (history_index < history.count) {
-                if (history_index == 0) {
-                    free(draft);
-                    draft = copy_string(line.data);
-                }
-                history_index++;
-                line_set(&line, history.items[history.count - history_index]);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_DOWN:
-            if (history_index > 0) {
-                history_index--;
-                line_set(&line, history_index == 0
-                    ? (draft ? draft : "")
-                    : history.items[history.count - history_index]);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_TAB:
-            complete_line(prompt, &line, bindings, &rendered_columns);
-            break;
-        case KEY_CTRL_U:
-            line_delete(&line, 0, line.count);
-            line_render(prompt, &line, &rendered_columns);
-            break;
-        case KEY_CTRL_C:
-            printf("\r\n");
-            line_set(&line, "");
-            goto done;
-        case KEY_CTRL_D:
-            if (line.count == 0) {
-                printf("\r\n");
-                status = INPUT_EOF;
-                goto done;
-            }
-            if (line.cursor < line.count) {
-                size_t to = next_codepoint(line.data, line.count, line.cursor);
-                line_delete(&line, line.cursor, to);
-                line_render(prompt, &line, &rendered_columns);
-            }
-            break;
-        case KEY_EOF:
-            printf("\r\n");
-            status = INPUT_EOF;
-            goto done;
-        case KEY_UNKNOWN:
-            break;
-        }
-    }
-
-done:
-    free(draft);
-    if (raw) terminal_leave_raw();
-    return status;
-}
-
 void replace_active_file_path_from_lexer_if_not_empty(Lexer l, char **active_file_path)
 {
     const char *path_data = &l.content[l.cur.pos];
@@ -2663,10 +1477,9 @@ void replace_active_file_path_from_lexer_if_not_empty(Lexer l, char **active_fil
 int main(int argc, char **argv)
 {
     static char buffer[1024];
+    static Commands commands = {0};
     static Bindings bindings = {0};
     static Lexer l = {0};
-    static Opens session_opens = {0};
-    Parse_Context ctx = {&bindings, &session_opens, NULL};
 
     init_name_locale();
 
@@ -2703,13 +1516,12 @@ int main(int argc, char **argv)
     printf("Enter :help for more info\n");
     for (;;) {
 again:
-        {
-            Input_Status status = input_read_line("@> ", &bindings, buffer, sizeof(buffer));
-            if (status == INPUT_EOF) goto quit;
-            if (status == INPUT_ERROR) {
-                printf("\n");
-                goto quit;
-            }
+        printf("@> ");
+        fflush(stdout);
+        if (!fgets(buffer, sizeof(buffer), stdin)) {
+            if (feof(stdin)) goto quit;
+            printf("\n");
+            goto again;
         }
         const char *source = buffer;
 
@@ -2720,7 +1532,8 @@ again:
         if (l.token == TOKEN_COLON) {
             if (!lexer_next(&l)) goto again;
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
-            if (command(l.string.items, "load")) {
+            commands.count = 0;
+            if (command(&commands, l.string.items, "load", "[path]", "Load/reload bindings from a file.")) {
                 replace_active_file_path_from_lexer_if_not_empty(l, &active_file_path);
                 if (active_file_path == NULL) {
                     fprintf(stderr, "ERROR: No active file to reload from. Do `:load <path>`.\n");
@@ -2731,7 +1544,7 @@ again:
                 create_bindings_from_file(active_file_path, &bindings);
                 goto again;
             }
-            if (command(l.string.items, "save")) {
+            if (command(&commands, l.string.items, "save", "[path]", "Save current bindings to a file.")) {
                 replace_active_file_path_from_lexer_if_not_empty(l, &active_file_path);
                 if (active_file_path == NULL) {
                     fprintf(stderr, "ERROR: No active file to save to. Do `:save <path>`.\n");
@@ -2741,7 +1554,7 @@ again:
                 static String_Builder sb = {0};
                 sb.count = 0;
                 for (size_t i = 0; i < bindings.count; ++i) {
-                    sb_appendf(&sb, "%s = ", bindings.items[i].name);
+                    sb_appendf(&sb, "%s := ", bindings.items[i].name);
                     expr_display(bindings.items[i].body, &sb);
                     sb_appendf(&sb, ";\n");
                 }
@@ -2763,7 +1576,7 @@ again:
                 printf("Saved all the bindings to %s\n", active_file_path);
                 goto again;
             }
-            if (command(l.string.items, "edit")) {
+            if (command(&commands, l.string.items, "edit", "[path]", "Edit current active file. Reload it on exit.")) {
 #ifdef _WIN32
                 fprintf(stderr, "TODO: editing files is not implemented on Windows yet! Sorry!\n");
 #else
@@ -2784,7 +1597,7 @@ again:
 #endif // _WIN32
                 goto again;
             }
-            if (command(l.string.items, "list")) {
+            if (command(&commands, l.string.items, "list", "[names...]", "list the bindings")) {
                 static String_Builder sb = {0};
                 static struct {
                     const char **items;
@@ -2806,7 +1619,7 @@ again:
                 if (args.count == 0) {
                     for (size_t i = 0; i < bindings.count; ++i) {
                         sb.count = 0;
-                        sb_appendf(&sb, "%s = ", bindings.items[i].name);
+                        sb_appendf(&sb, "%s := ", bindings.items[i].name);
                         expr_display(bindings.items[i].body, &sb);
                         sb_appendf(&sb, ";");
                         sb_append_null(&sb);
@@ -2821,7 +1634,7 @@ again:
                     for (size_t i = 0; !found && i < bindings.count; ++i) {
                         if (bindings.items[i].name == label) {
                             sb.count = 0;
-                            sb_appendf(&sb, "%s = ", bindings.items[i].name);
+                            sb_appendf(&sb, "%s := ", bindings.items[i].name);
                             expr_display(bindings.items[i].body, &sb);
                             sb_appendf(&sb, ";");
                             sb_append_null(&sb);
@@ -2837,7 +1650,7 @@ again:
 
                 goto again;
             }
-            if (command(l.string.items, "delete")) {
+            if (command(&commands, l.string.items, "delete", "<name>", "delete a binding by name")) {
                 if (!lexer_expect(&l, TOKEN_NAME)) goto again;
                 const char *name = intern_label(l.string.items);
                 for (size_t i = 0; i < bindings.count; ++i) {
@@ -2850,9 +1663,9 @@ again:
                 printf("ERROR: binding %s was not found\n", name);
                 goto again;
             }
-            if (command(l.string.items, "debug")) {
+            if (command(&commands, l.string.items, "debug", "<expr>", "Step debug the evaluation of an expression")) {
                 Expr_Index expr;
-                if (!parse_expr(&l, &ctx, &expr)) goto again;
+                if (!parse_expr(&l, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 for (size_t i = bindings.count; i > 0; --i) {
                     expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);
@@ -2893,165 +1706,42 @@ again:
 
                 goto again;
             }
-            if (command(l.string.items, "set")) {
-                if (!lexer_next(&l)) goto again;
-                if (l.token != TOKEN_NAME) {
-                    if (l.token != TOKEN_END) lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Expected a setting name after :set. Try `:set debruijn on`.\n");
-                    goto again;
-                }
-                bool is_debruijn = strcmp(l.string.items, "debruijn") == 0;
-                bool is_unicode  = strcmp(l.string.items, "unicode") == 0;
-                bool is_shorthand = strcmp(l.string.items, "shorthand") == 0;
-                if (!is_debruijn && !is_unicode && !is_shorthand) {
-                    lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Unknown setting `%s`. Expected `debruijn`, `unicode`, or `shorthand`\n", l.string.items);
-                    goto again;
-                }
-                const char *key_name = is_debruijn ? "debruijn"
-                    : is_unicode ? "unicode"
-                    : "shorthand";
-
+            if (command(&commands, l.string.items, "debruijn", "[on|off]", "Toggle printing of variables as de Bruijn indices.")) {
                 if (!lexer_next(&l)) goto again;
                 if (l.token == TOKEN_END) {
-                    if (is_debruijn) {
-                        debruijn_mode = debruijn_mode == DEBRUIJN_OFF
-                            ? DEBRUIJN_ON
-                            : DEBRUIJN_OFF;
-                    } else if (is_unicode) {
-                        unicode_mode = !unicode_mode;
-                    } else {
-                        shorthand_mode = !shorthand_mode;
-                    }
+                    output_debruijn_indices = !output_debruijn_indices;
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "on") == 0) {
-                    if (is_debruijn)       debruijn_mode  = DEBRUIJN_ON;
-                    else if (is_unicode)   unicode_mode   = true;
-                    else                   shorthand_mode = true;
+                    output_debruijn_indices = true;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else if (l.token == TOKEN_NAME && strcmp(l.string.items, "off") == 0) {
-                    if (is_debruijn)       debruijn_mode  = DEBRUIJN_OFF;
-                    else if (is_unicode)   unicode_mode   = false;
-                    else                   shorthand_mode = false;
-                    if (!lexer_expect(&l, TOKEN_END)) goto again;
-                } else if (is_debruijn && l.token == TOKEN_NAME && strcmp(l.string.items, "full") == 0) {
-                    debruijn_mode = DEBRUIJN_FULL;
+                    output_debruijn_indices = false;
                     if (!lexer_expect(&l, TOKEN_END)) goto again;
                 } else {
                     lexer_print_loc(&l, stderr);
-                    if (is_debruijn) {
-                        fprintf(stderr, "ERROR: Expected `on`, `off`, `full`, or no argument after :set debruijn\n");
-                    } else {
-                        fprintf(stderr, "ERROR: Expected `on`, `off`, or no argument after :set %s\n", key_name);
-                    }
+                    fprintf(stderr, "ERROR: Expected `on`, `off`, or no argument after :debruijn\n");
                     goto again;
                 }
-                if (is_debruijn) {
-                    printf("De Bruijn indices output: %s\n", debruijn_mode_name(debruijn_mode));
-                } else if (is_unicode) {
-                    printf("Unicode lambda output: %s\n", unicode_mode ? "ON" : "OFF");
-                } else {
-                    printf("Lambda shorthand output: %s\n", shorthand_mode ? "ON" : "OFF");
-                }
+                printf("De Bruijn indices output: %s\n", output_debruijn_indices ? "ON" : "OFF");
                 goto again;
             }
-            if (command(l.string.items, "ast")) {
+            if (command(&commands, l.string.items, "ast", "<expr>", "print the AST of the expression")) {
                 Expr_Index expr;
-                if (!parse_expr(&l, &ctx, &expr)) goto again;
+                if (!parse_expr(&l, &expr)) goto again;
                 if (!lexer_expect(&l, TOKEN_END)) goto again;
                 dump_expr_ast(expr);
                 goto again;
             }
-            if (command(l.string.items, "quit")) goto quit;
-            if (command(l.string.items, "help")) {
-                print_available_commands();
+            if (command(&commands, l.string.items, "quit", "", "quit the REPL")) goto quit;
+            if (command(&commands, l.string.items, "help", "", "print this help message")) {
+                print_available_commands(&commands);
                 goto again;
             }
-            print_available_commands();
+            print_available_commands(&commands);
             printf("ERROR: unknown command `%s`\n", l.string.items);
             goto again;
         }
 
-        // `in` is reserved and cannot start a statement.
-        if (l.token == TOKEN_IN) {
-            report_reserved_keyword(&l);
-            goto again;
-        }
-
-        // `open ns;` (or just `open ns`) opens namespaces for the rest of the
-        // REPL session. `open ns in expr` opens them only while parsing expr,
-        // so it is handled as an expression below.
-        if (l.token == TOKEN_OPEN) {
-            Cur before_open = l.cur;
-            if (!lexer_expect(&l, TOKEN_OPEN)) goto again;
-            if (!lexer_next(&l)) goto again;
-
-            size_t base = session_opens.count;
-            bool open_in = false;
-            while (l.token == TOKEN_NAME) {
-                da_append(&session_opens, intern_label(l.string.items));
-                if (!lexer_next(&l)) goto again;
-            }
-            if (l.token == TOKEN_IN) open_in = true;
-
-            if (open_in) {
-                if (session_opens.count == base) {
-                    lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
-                    goto again;
-                }
-                session_opens.count = base;
-                l.cur = before_open;
-            } else {
-                if (session_opens.count == base) {
-                    lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
-                    goto again;
-                }
-                if (l.token == TOKEN_SEMICOLON) {
-                    if (!lexer_next(&l)) goto again;
-                }
-                if (l.token != TOKEN_END) {
-                    session_opens.count = base;
-                    report_unexpected(&l, TOKEN_END);
-                    goto again;
-                }
-                for (size_t i = base; i < session_opens.count; ++i) {
-                    printf("Opened namespace %s\n", session_opens.items[i]);
-                }
-                goto again;
-            }
-        }
-
-        // `section name` prefixes the following definitions with `name/` and
-        // lets them refer to each other unqualified. A bare `section` returns
-        // to the empty section. The semicolon is optional in the REPL.
-        if (l.token == TOKEN_SECTION) {
-            if (!lexer_expect(&l, TOKEN_SECTION)) goto again;
-            if (!lexer_next(&l)) goto again;
-            const char *section = NULL;
-            if (l.token == TOKEN_NAME) {
-                section = intern_label(l.string.items);
-                if (!section_name_valid(section)) {
-                    lexer_print_loc(&l, stderr);
-                    fprintf(stderr, "ERROR: A section name cannot end with `/`\n");
-                    goto again;
-                }
-                if (!lexer_next(&l)) goto again;
-            }
-            if (l.token == TOKEN_SEMICOLON) {
-                if (!lexer_next(&l)) goto again;
-            }
-            if (l.token != TOKEN_END) {
-                report_unexpected(&l, TOKEN_END);
-                goto again;
-            }
-            ctx.section = section;
-            if (section) printf("Entered section %s\n", section);
-            else printf("Closed section\n");
-            goto again;
-        }
-
-        // NOTE: `name arg1 arg2 = body` is a binding definition.
+        // NOTE: `name arg1 arg2 := body` is a binding definition.
         bool is_binding = false;
         Cur cur = l.cur; {
             if (!lexer_next(&l)) goto again;
@@ -3067,14 +1757,14 @@ again:
             if (!lexer_expect(&l, TOKEN_NAME)) goto again;
             const char *name = intern_label(l.string.items);
             Expr_Index body;
-            if (!parse_binding_body(&l, &ctx, &body)) goto again;
+            if (!parse_binding_body(&l, &body)) goto again;
             if (!lexer_expect(&l, TOKEN_END)) goto again;
-            create_binding(&bindings, qualify_name(ctx.section, name), body);
+            create_binding(&bindings, name, body);
             goto again;
         }
 
         Expr_Index expr;
-        if (!parse_expr(&l, &ctx, &expr)) goto again;
+        if (!parse_expr(&l, &expr)) goto again;
         if (!lexer_expect(&l, TOKEN_END)) goto again;
         for (size_t i = bindings.count; i > 0; --i) {
             expr = subst_free_name(expr, bindings.items[i-1].name, bindings.items[i-1].body, 0);
