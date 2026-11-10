@@ -471,6 +471,28 @@ Opened namespace nat
 RESULT: foo
 ```
 
+A namespace followed by a parenthesized list opens only the listed members; a
+namespace without a list is opened whole. Groups can be mixed freely and are
+processed in the order written:
+
+```
+@> open bool (tru fls) pair (fst snd)
+Opened bool/tru
+Opened bool/fls
+Opened pair/fst
+Opened pair/snd
+@> :ast tru
+[VAR] bool/tru
+@> :ast and
+[VAR] and
+@> :ast pair
+[VAR] pair
+```
+
+Members that are not listed stay out of scope, so `and` and `pair` above remain
+free names while `bool/and` and `pair/pair` are still usable qualified. The
+same grouping works in `open ... in ...`:
+
 If a name is defined in more than one open namespace (or both bare and in an
 open namespace), the interpreter reports an ambiguity. Qualify the name to
 disambiguate:
@@ -497,6 +519,11 @@ RESULT: foo
 The body of `open ... in` extends as far right as possible, like a lambda; use
 parentheses to limit it. An unqualified name that no opened namespace defines is
 left as written, so `id` keeps working while `nat` is open.
+
+```
+@> open pair (pair fst) in fst (pair foo bar)
+RESULT: foo
+```
 
 In a binding file `open` lasts until the end of that file and is scoped to it:
 loading a file does not change the namespaces the REPL has open. In the REPL it

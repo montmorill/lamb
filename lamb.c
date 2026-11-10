@@ -1224,10 +1224,17 @@ typedef struct {
     size_t capacity;
 } Bindings;
 
+// One opened name. `member` is NULL when the whole namespace is opened;
+// otherwise only that one member of it is visible through the namespace.
+typedef struct {
+    const char *ns;
+    const char *member;
+} Open;
+
 // Namespaces opened with `open`. Opening is not a lexical scope: it only tells
 // the parser how to expand an unqualified name that is not a binding on its own.
 typedef struct {
-    const char **items;
+    Open *items;
     size_t count;
     size_t capacity;
 } Opens;
@@ -1279,8 +1286,10 @@ bool resolve_open_name(Parse_Context *ctx, const char *name, const char **result
     if (binding_exists(ctx->bindings, name)) found = intern_label(name);
 
     for (size_t i = 0; i < ctx->opens->count; ++i) {
+        const Open *open = &ctx->opens->items[i];
+        if (open->member != NULL && open->member != name) continue;
         sb.count = 0;
-        sb_appendf(&sb, "%s/%s", ctx->opens->items[i], name);
+        sb_appendf(&sb, "%s/%s", open->ns, name);
         sb_append_null(&sb);
         const char *qualified = intern_label(sb.items);
         if (!binding_exists(ctx->bindings, qualified)) continue;
@@ -1316,6 +1325,52 @@ const char *qualify_name(const char *section, const char *name)
     sb_appendf(&sb, "%s/%s", section, name);
     sb_append_null(&sb);
     return intern_label(sb.items);
+}
+
+// Parses the list after `open`: whitespace-separated items, each either
+// `NAMESPACE` (open every member) or `NAMESPACE (MEMBER ...)` (open only the
+// listed members). When `row_limited` is true only names starting on `row`
+// begin an item, which lets a binding file end the statement at the line
+// break. On return `l->token` is the token that ended the list, with the lexer
+// positioned before it so the caller can consume it normally.
+bool parse_open_items(Lexer *l, Opens *opens, bool row_limited, size_t row)
+{
+    if (!lexer_peek(l)) return false;
+    for (;;) {
+        if (l->token != TOKEN_NAME) break;
+        if (row_limited && l->row != row) break;
+        if (!lexer_expect(l, TOKEN_NAME)) return false;
+        const char *ns = intern_label(l->string.items);
+
+        if (!lexer_peek(l)) return false;
+        if (l->token != TOKEN_OPAREN) {
+            Open open = { .ns = ns, .member = NULL };
+            da_append(opens, open);
+            continue;
+        }
+
+        // Consume `(`.
+        if (!lexer_next(l)) return false;
+        for (;;) {
+            if (!lexer_peek(l)) return false;
+            if (l->token == TOKEN_CPAREN) break;
+            if (l->token != TOKEN_NAME) {
+                if (!report_reserved_keyword(l)) {
+                    lexer_print_loc(l, stderr);
+                    fprintf(stderr, "ERROR: Expected a member name or `)` after `%s (`\n", ns);
+                }
+                return false;
+            }
+            if (!lexer_expect(l, TOKEN_NAME)) return false;
+            Open open = { .ns = ns, .member = intern_label(l->string.items) };
+            da_append(opens, open);
+        }
+
+        // Consume `)`.
+        if (!lexer_next(l)) return false;
+        if (!lexer_peek(l)) return false;
+    }
+    return true;
 }
 
 bool parse_expr_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr_Index *expr);
@@ -1407,22 +1462,12 @@ bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr
         // `open ns ... in expr` scopes the named namespaces to `expr`. `open`
         // is reserved, so there is no fallback to an ordinary variable name.
         size_t base = ctx->opens->count;
-        bool saw_in = false;
-
-        for (;;) {
-            if (!lexer_next(l)) {
-                ctx->opens->count = base;
-                return false;
-            }
-            if (l->token == TOKEN_IN) {
-                saw_in = true;
-                break;
-            }
-            if (l->token != TOKEN_NAME) break;
-            da_append(ctx->opens, intern_label(l->string.items));
+        if (!parse_open_items(l, ctx->opens, false, 0)) {
+            ctx->opens->count = base;
+            return false;
         }
 
-        if (!saw_in) {
+        if (l->token != TOKEN_IN) {
             lexer_print_loc(l, stderr);
             if (ctx->opens->count == base) {
                 fprintf(stderr, "ERROR: Expected a namespace name after `open`\n");
@@ -1436,6 +1481,12 @@ bool parse_primary_scope(Lexer *l, Binder_Stack *scope, Parse_Context *ctx, Expr
         if (ctx->opens->count == base) {
             lexer_print_loc(l, stderr);
             fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
+            ctx->opens->count = base;
+            return false;
+        }
+
+        // Consume `in`.
+        if (!lexer_next(l)) {
             ctx->opens->count = base;
             return false;
         }
@@ -1618,14 +1669,10 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
         if (l.token == TOKEN_OPEN) {
             if (!lexer_expect(&l, TOKEN_OPEN)) return false;
 
-            size_t open_row = l.row;
             size_t base = opens.count;
-            Cur after_last = l.cur;
-            for (;;) {
-                if (!lexer_next(&l)) return false;
-                if (l.token != TOKEN_NAME || l.row != open_row) break;
-                da_append(&opens, intern_label(l.string.items));
-                after_last = l.cur;
+            if (!parse_open_items(&l, &opens, true, l.row)) {
+                opens.count = base;
+                return false;
             }
 
             if (opens.count == base) {
@@ -1639,12 +1686,11 @@ bool create_bindings_from_file(const char *file_path, Bindings *bindings)
                 return false;
             }
             if (l.token == TOKEN_SEMICOLON) {
+                if (!lexer_next(&l)) return false;
                 if (!lexer_peek(&l)) return false;
-            } else {
-                // The token after the last namespace is the next statement.
-                // Rewind so that the loop reads it again.
-                l.cur = after_last;
             }
+            // Otherwise `l.token` is the first token of the next statement
+            // with the lexer before it, ready for the next iteration.
             continue;
         }
 
@@ -2023,23 +2069,20 @@ again:
             goto again;
         }
 
-        // `open ns;` (or just `open ns`) opens namespaces for the rest of the
-        // REPL session. `open ns in expr` opens them only while parsing expr,
-        // so it is handled as an expression below.
+        // `open ns ...;` (or just `open ns ...`) opens namespaces for the rest
+        // of the REPL session. `open ns ... in expr` opens them only while
+        // parsing expr, so it is handled as an expression below.
         if (l.token == TOKEN_OPEN) {
             Cur before_open = l.cur;
             if (!lexer_expect(&l, TOKEN_OPEN)) goto again;
-            if (!lexer_next(&l)) goto again;
 
             size_t base = session_opens.count;
-            bool open_in = false;
-            while (l.token == TOKEN_NAME) {
-                da_append(&session_opens, intern_label(l.string.items));
-                if (!lexer_next(&l)) goto again;
+            if (!parse_open_items(&l, &session_opens, false, 0)) {
+                session_opens.count = base;
+                goto again;
             }
-            if (l.token == TOKEN_IN) open_in = true;
 
-            if (open_in) {
+            if (l.token == TOKEN_IN) {
                 if (session_opens.count == base) {
                     lexer_print_loc(&l, stderr);
                     fprintf(stderr, "ERROR: Expected a namespace name between `open` and `in`\n");
@@ -2054,7 +2097,11 @@ again:
                     goto again;
                 }
                 if (l.token == TOKEN_SEMICOLON) {
+                    // `parse_open_items` leaves the cursor before the current
+                    // token, so re-read the `;` and then load the token after
+                    // it.
                     if (!lexer_next(&l)) goto again;
+                    if (!lexer_peek(&l)) goto again;
                 }
                 if (l.token != TOKEN_END) {
                     session_opens.count = base;
@@ -2062,7 +2109,12 @@ again:
                     goto again;
                 }
                 for (size_t i = base; i < session_opens.count; ++i) {
-                    printf("Opened namespace %s\n", session_opens.items[i]);
+                    const Open *open = &session_opens.items[i];
+                    if (open->member != NULL) {
+                        printf("Opened %s/%s\n", open->ns, open->member);
+                    } else {
+                        printf("Opened namespace %s\n", open->ns);
+                    }
                 }
                 goto again;
             }
